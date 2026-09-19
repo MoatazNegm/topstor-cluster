@@ -2182,3 +2182,105 @@ To be transparent about what's NOT in the recovery path:
   boot, so they're fine.
 - **Any keys/secrets** that may have been added to the cluster after
   the original image builds — review your own docs.
+
+### 20.12 ZFS kernel modules — build & persist on Rocky 9 hosts
+
+Ubuntu 22.04+ hosts get ZFS for free via DKMS. **On Rocky 9 / RHEL
+9 hosts the host kernel modules must be built manually.** This
+section is the canonical recipe; it is run ONCE on a fresh host.
+
+#### Why this is needed
+
+The `topstor/zfs:v3` container has the ZFS **userspace tools**
+(`zfs`, `zpool`, `libzfs.so`) baked into the image. But those tools
+talk to the kernel via `/dev/zfs`, which only exists if the kernel
+modules `spl.ko` + `zfs.ko` are loaded on the host. On Rocky 9
+there is no prebuilt ZFS RPM in the default repos, so we build
+from source.
+
+#### Recipe (verified on `5.14.0-687.42.1.el9_8`)
+
+```bash
+# Step 1 — install build prerequisites
+sudo dnf install -y gcc make kernel-devel rpm-build wget tar xz
+
+# Step 2 — download the OpenZFS 2.4.4 source tarball
+#    (or copy /tmp/zfs-2.4.4 if available from backup)
+cd /tmp
+[ ! -d zfs-2.4.4 ] && \
+  wget -q https://github.com/openzfs/zfs/releases/download/zfs-2.4.4/zfs-2.4.4.tar.gz \
+    && tar -xzf zfs-2.4.4.tar.gz
+
+cd /tmp/zfs-2.4.4
+
+# Step 3 — IMPORTANT: make sure kernel-devel is pristine.
+#    An earlier in-place build can leave a modified .config in
+#    /usr/src/kernels/.../ which makes the modules incompatible with
+#    the running kernel. Reinstall to restore a clean state.
+sudo dnf reinstall -y kernel-devel
+
+# Step 4 — build the kernel modules
+./configure --with-linux=/usr/src/kernels/$(uname -r) \
+            --with-linux-obj=/usr/src/kernels/$(uname -r)
+make -C module -j$(nproc)
+
+# Step 5 — install
+sudo cp module/spl.ko module/zfs.ko /lib/modules/$(uname -r)/extra/
+sudo depmod -a
+sudo modprobe zfs
+lsmod | grep -E "zfs|spl"   # should show both loaded
+```
+
+#### Make it persist across reboots
+
+```bash
+# Auto-load spl + zfs on every boot
+sudo tee /etc/modules-load.d/zfs.conf > /dev/null <<'EOF'
+# Auto-load ZFS kernel modules on boot
+spl
+zfs
+EOF
+```
+
+#### Verify
+
+```bash
+# Host-side
+zpool status
+zfs list
+ls -l /dev/zfs
+
+# Inside the zfs container (Docker-in-Docker — same kernel)
+docker exec zfs zfs list
+docker exec zfs zpool status
+```
+
+Expected output when no pools exist:
+```
+no datasets available
+no pools available
+```
+
+#### If `modprobe zfs` returns "Exec format error"
+
+This means the modules were built against a different `struct
+module` layout than the running kernel has. The 99% cause is a
+corrupted kernel-devel install. Fix:
+
+```bash
+sudo dnf reinstall -y kernel-devel
+# Then rebuild ZFS from step 4
+```
+
+#### Files persisted by this recipe
+
+| File | Purpose |
+|---|---|
+| `/lib/modules/$(uname -r)/extra/spl.ko` | SPL kernel module (Solaris Porting Layer) |
+| `/lib/modules/$(uname -r)/extra/zfs.ko` | ZFS kernel module |
+| `/etc/modules-load.d/zfs.conf` | systemd hook to auto-load on boot |
+| `/tmp/zfs-2.4.4/` | OpenZFS source tree (build artifacts) |
+
+The two `.ko` files are recreated automatically on every kernel
+upgrade by re-running this recipe (this is the equivalent of DKMS
+for Rocky).
