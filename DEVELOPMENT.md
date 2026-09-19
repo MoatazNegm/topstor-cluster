@@ -1989,3 +1989,196 @@ This is the final audit. The cluster can now run `docker_setup.sh`
 end-to-end and have the zfs container provide the full hot-path
 command surface for fapi.py + the 12+ loopers + RabbitMQ-fed
 cross-node execution.
+
+---
+
+## 20. Disaster Recovery — Redeploy From a Fresh OS
+
+This section describes how to rebuild the entire TopStor cluster on
+a clean machine. Source of truth is the `MoatazNegm/topstor-cluster`
+Git repository and the `moataznegm/topstor-*` DockerHub images.
+
+### 20.1 Host prerequisites (clean Rocky Linux 9 OR Ubuntu 22.04+)
+
+Install these on the fresh host before touching any TopStor code:
+
+```bash
+# Rocky 9 / RHEL 9 family
+sudo dnf install -y git docker docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker   # refresh group membership
+
+# Ubuntu 22.04+ family  (preferred if you ever want ZFS — see §20.7)
+# sudo apt update && sudo apt install -y git docker.io docker-compose-v2
+```
+
+### 20.2 Clone the repository
+
+```bash
+sudo mkdir -p /root/topstor && sudo chown $USER /root/topstor
+cd /root/topstor
+git clone https://github.com/MoatazNegm/topstor-cluster.git .
+```
+
+What you get from the repo:
+
+| Component | Source | Notes |
+|---|---|---|
+| `Dockerfile.zfs` | repo | builds `topstor/zfs:v3` |
+| `Dockerfile.proxy` | repo | builds `topstor/proxy:fixed` |
+| `Dockerfile.abdopuppet` | repo | builds `topstor/abdopuppet:latest` |
+| `docker-compose.yml` | repo | multi-node stack |
+| `scripts/*.sh` | repo | entrypoints + systemctl wrapper + lighttpd config |
+| `volumes/linux-env/{TopStor,pace,topstorweb}/` | repo | TopStor source code (working trees) |
+| `volumes/topstor-dev/{src,public,package.json}/` | repo | React UI source (NO `node_modules`) |
+| `volumes/puppet-srv/` | **excluded** | rebuilt in §20.5 |
+| `*.tar.gz` (docker-binaries, zfs-tools, erlang-rabbitmq) | **excluded** | baked into images via Dockerfile |
+
+### 20.3 Pull the published Docker images (fastest path)
+
+If you don't want to rebuild from source, pull the published images
+that mirror the currently-running cluster:
+
+```bash
+docker pull moataznegm/topstor-zfs:cluster-v3
+docker pull moataznegm/topstor-proxy:cluster-fixed
+docker pull moataznegm/topstor-abdopuppet:cluster-latest
+
+# Tag them as the compose file expects
+docker tag moataznegm/topstor-zfs:cluster-v3            topstor/zfs:v3
+docker tag moataznegm/topstor-proxy:cluster-fixed       topstor/proxy:fixed
+docker tag moataznegm/topstor-abdopuppet:cluster-latest topstor/abdopuppet:latest
+```
+
+### 20.4 OR rebuild the images from source
+
+If you want to bake any local changes, build from the cloned repo:
+
+```bash
+cd /root/topstor
+docker compose build         # builds all three from their Dockerfiles
+```
+
+This requires:
+- The three binary tarballs that used to live at `/root/topstor/`:
+  - `docker-binaries.tar.gz` (docker CLI + daemon)
+  - `zfs-tools.tar.gz`       (userspace zfs/zpool + libs)
+  - `erlang-rabbitmq.tar.gz` (RabbitMQ + Erlang for the zfs container)
+  - These are NOT in git. Regenerate them from a known-good source
+    or copy them from a backup.
+- Outbound network access to Rocky/Ubuntu repos for `dnf install`
+  during build (the Dockerfile installs ~211 packages).
+
+### 20.5 Regenerate `volumes/puppet-srv/*.git` bare repos
+
+The puppet master (`abdopuppet` container) serves these bare repos
+via `git-daemon` for the cluster clients. They are excluded from
+git because they total ~850 MB of accumulated history. Rebuild them
+from the working-tree sources in `volumes/linux-env/`:
+
+```bash
+sudo mkdir -p /root/topstor/volumes/puppet-srv
+sudo chown $USER /root/topstor/volumes/puppet-srv
+cd /root/topstor/volumes/linux-env
+
+# Mirror each working tree as a bare repo
+for repo in TopStor pace topstorweb; do
+    git clone --bare "./$repo" "/root/topstor/volumes/puppet-srv/$repo.git"
+done
+
+# Optional: also add HC.git if the cluster uses it (only present on
+# production clusters, not in dev)
+# git clone --bare /path/to/HC /root/topstor/volumes/puppet-srv/HC.git
+```
+
+The resulting bare repos are immediately useful — `git-daemon`
+(in the abdopuppet container) will start serving them on container
+boot.
+
+### 20.6 Regenerate `volumes/topstor-dev/node_modules/`
+
+The React UI source is checked in, but its `node_modules/` (128 MB)
+is excluded. Rebuild with:
+
+```bash
+cd /root/topstor/volumes/topstor-dev
+npm install
+```
+
+This requires:
+- Node.js 18+ on the host (or run inside the abdopuppet container
+  via `docker exec abdopuppet bash -c "cd /workspace && npm install"`)
+- Outbound network to npmjs.org
+
+### 20.7 OS choice — Rocky vs Ubuntu
+
+| Feature | Rocky Linux 9 | Ubuntu 22.04+ |
+|---|---|---|
+| Image compatibility | ✅ matches Dockerfile | ⚠️ may need small patches |
+| Docker setup | `dnf install docker` | `apt install docker.io` |
+| ZFS storage | ❌ requires manual rebuild (see the section above about `struct module size` failures) | ✅ `apt install zfsutils-linux` — works out of the box |
+| Kernel upgrades break ZFS | ❌ yes (this is the disaster you're preventing) | ✅ no — DKMS auto-rebuilds |
+
+**Recommendation:** If you anticipate needing ZFS storage, install
+Ubuntu 22.04+ instead of Rocky. Everything else (compose stack,
+network, code) is identical.
+
+### 20.8 Bring up the cluster
+
+```bash
+cd /root/topstor
+docker compose up -d
+docker compose ps            # confirm 3/3 healthy
+docker exec zfs docker ps    # confirm DinD shows ONLY this node's containers
+docker exec zfs zfs list     # works on Ubuntu; fails on Rocky until kernel rebuild
+```
+
+### 20.9 Post-deploy sanity checks
+
+```bash
+# SSH into the ZFS node
+ssh root@10.11.11.101   # password: Abdoadmin
+
+# Inside zfs container — verify DinD isolation
+docker ps                       # should be EMPTY for new cluster
+which vim                       # should be /usr/bin/vim (vim-minimal baked in)
+
+# Inside abdopuppet — verify git-daemon
+ssh root@10.11.11.14
+git clone git://10.11.11.14/TopStor /tmp/test-clone    # should succeed
+
+# Inside proxy — verify web UI
+curl -s http://10.11.11.13:8080 | head -20
+```
+
+### 20.10 Verified state of `cluster-v3` / `cluster-fixed` / `cluster-latest`
+
+These tags were captured from the production cluster at the time
+this section was written:
+
+| Tag | SHA | Size | Captured from local |
+|---|---|---|---|
+| `moataznegm/topstor-zfs:cluster-v3` | `798efb605b68` | 1.53 GB | `topstor/zfs:v3` |
+| `moataznegm/topstor-proxy:cluster-fixed` | `90d0a969b2c6` | 745 MB | `topstor/proxy:fixed` |
+| `moataznegm/topstor-abdopuppet:cluster-latest` | `2158392c2581` | 520 MB | `topstor/abdopuppet:latest` |
+
+If you ever need to roll back or compare, those three DockerHub tags
+are the exact byte-for-byte snapshots of what was running.
+
+### 20.11 What was NOT backed up
+
+To be transparent about what's NOT in the recovery path:
+
+- **ZFS pools / datasets** on the host — if any exist, they need
+  `zpool export` first, then `zpool import` after redeploy. Their
+  content is NOT mirrored anywhere.
+- **Volumes mounted at `/var/lib/docker`** on the host — the bind
+  mount `./var/lib/docker:/var/lib/docker` in compose means cluster
+  container state lives on the host filesystem. Back this up
+  separately if it matters.
+- **`/TopStordata/diskchange`** and other seed files in the ZFS
+  container — these are recreated by `entrypoint-zfs.sh` on every
+  boot, so they're fine.
+- **Any keys/secrets** that may have been added to the cluster after
+  the original image builds — review your own docs.
