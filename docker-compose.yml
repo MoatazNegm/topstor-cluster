@@ -66,10 +66,14 @@ services:
   zfs:
     container_name: zfs
     hostname: zfs
-    build:
-      context: .
-      dockerfile: Dockerfile.zfs
-    image: topstor/zfs:v3
+    # No `build:` block — use the patched image topstor/zfs:v3-patched instead
+    # of rebuilding from Dockerfile.zfs. The build step pulls packages from
+    # the internet (dnf install), which we want to avoid here. The patched
+    # image was produced with `docker commit` from a container running the
+    # updated entrypoint-zfs.sh and captures every in-place fix we have
+    # made (docker stale-pidfile cleanup, retry on containerd race, etc.)
+    # without re-fetching any RPMs.
+    image: topstor/zfs:v3-patched
     restart: unless-stopped
     privileged: true
     ports:
@@ -81,6 +85,8 @@ services:
       # its own dockerd and have isolated container visibility (docker ps shows only
       # containers started by this ZFS node, not all host containers).
       - /var/lib/docker:/var/lib/docker
+      # Flag file to prevent docker_setup.sh from auto-running on container start.
+      - ./volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro
 
     networks:
       topstor_gitnet:
@@ -100,6 +106,11 @@ services:
       dockerfile: Dockerfile.proxy
     image: topstor/proxy:fixed
     restart: unless-stopped
+    # `init: true` injects Docker's built-in tini as PID 1. It reaps zombie
+    # sshd-session processes that accumulate when the entrypoint script is
+    # the direct PID 1 (tail -f /dev/null never calls wait()) and it
+    # forwards SIGTERM cleanly so the container stops within the grace period.
+    init: true
     privileged: true
     ports:
       - "2223:22"

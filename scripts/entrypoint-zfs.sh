@@ -70,7 +70,62 @@ case "$cmd" in
            echo $! > /run/rabbitmq-server.pid)
         exit 0
     fi
-    # Other start targets: iscsid/target/docker — silently succeed in container
+    if [ "$svc" = "NetworkManager" ]; then
+        mkdir -p /var/run/NetworkManager /var/lib/NetworkManager /run/dbus /var/lib/dbus
+        if pgrep -x NetworkManager >/dev/null 2>&1; then
+            echo "NetworkManager already running"; exit 0
+        fi
+        # Install the double-fork daemonizer (idempotent — only if missing).
+        if [ ! -x /usr/local/sbin/start-nm.py ]; then
+            echo "systemctl: start-nm.py not installed; NetworkManager cannot start" >&2
+            exit 1
+        fi
+        /usr/local/sbin/start-nm.py
+        # Wait up to 15s for nmcli to become responsive so callers can use it.
+        for i in $(seq 1 15); do
+            if nmcli general status >/dev/null 2>&1; then
+                echo "NetworkManager started after ${i}s"
+                exit 0
+            fi
+            sleep 1
+        done
+        echo "NetworkManager failed to start within 15s" >&2
+        exit 1
+    fi
+    if [ "$svc" = "docker" ]; then
+        # docker_setup.sh calls `systemctl start docker` after it
+        # configures cmynode, expecting DinD to be live. The container
+        # has no systemd, so we launch dockerd directly with the same
+        # isolated graph root the entrypoint uses.
+        if pgrep -x dockerd >/dev/null 2>&1; then
+            echo "docker daemon already running"; exit 0
+        fi
+        # Full isolation from the host's docker: drop any leaked bind
+        # mounts of /var/run/docker.sock and /var/lib/docker. `-l` (lazy)
+        # works even when the path is busy with active overlay mounts.
+        umount /var/run/docker.sock 2>/dev/null || true
+        umount -l /var/lib/docker 2>/dev/null || true
+        # Clean up stale pidfile/socket from a crashed previous run.
+        rm -f /var/run/docker.pid /var/run/docker.sock
+        mkdir -p /var/lib/docker-inner
+        nohup /usr/bin/dockerd \
+            --host=unix:///var/run/docker.sock \
+            --storage-driver=vfs \
+            --data-root=/var/lib/docker-inner \
+            --exec-root=/var/run/docker \
+            > /var/log/dockerd.log 2>&1 &
+        disown
+        for i in $(seq 1 20); do
+            if [ -S /var/run/docker.sock ] && timeout 2 docker info >/dev/null 2>&1; then
+                echo "docker daemon started after ${i}s"
+                exit 0
+            fi
+            sleep 1
+        done
+        echo "docker daemon failed to start within 20s" >&2
+        exit 1
+    fi
+    # Other start targets: iscsid/target — silently succeed in container
     exit 0
     ;;
 
@@ -78,6 +133,20 @@ case "$cmd" in
     svc="${1:-}"
     if [ "$svc" = "rabbitmq-server" ]; then
         if pgrep -f beam.smp >/dev/null 2>&1; then
+            echo "active"; exit 0
+        else
+            echo "inactive"; exit 3
+        fi
+    fi
+    if [ "$svc" = "NetworkManager" ]; then
+        if nmcli general status >/dev/null 2>&1; then
+            echo "active"; exit 0
+        else
+            echo "inactive"; exit 3
+        fi
+    fi
+    if [ "$svc" = "docker" ]; then
+        if [ -S /var/run/docker.sock ] && timeout 2 docker info >/dev/null 2>&1; then
             echo "active"; exit 0
         else
             echo "inactive"; exit 3
@@ -95,11 +164,25 @@ case "$cmd" in
             echo "rabbitmq-server is not running"; exit 3
         fi
     fi
+    if [ "$svc" = "NetworkManager" ]; then
+        if nmcli general status >/dev/null 2>&1; then
+            echo "NetworkManager is running"; exit 0
+        else
+            echo "NetworkManager is not running"; exit 3
+        fi
+    fi
+    if [ "$svc" = "docker" ]; then
+        if [ -S /var/run/docker.sock ] && timeout 2 docker info >/dev/null 2>&1; then
+            echo "docker daemon is running"; exit 0
+        else
+            echo "docker daemon is not running"; exit 3
+        fi
+    fi
     # Unknown service — try real systemctl, then fail gracefully
     if command -v /usr/bin/systemctl >/dev/null 2>&1; then
         exec /usr/bin/systemctl status "$@"
     fi
-    echo "rabbitmq-server is not running"; exit 3
+    echo "service is not running"; exit 3
     ;;
 
   stop|disable|enable|restart|reload)
@@ -107,6 +190,59 @@ case "$cmd" in
     # For rabbitmq we at least kill the process.
     if [ "${1:-}" = "rabbitmq-server" ]; then
         pkill -f beam.smp 2>/dev/null; rm -f /run/rabbitmq-server.pid
+    fi
+    if [ "${1:-}" = "NetworkManager" ]; then
+        # `restart` is special: kill, then re-launch via start-nm.py.
+        # docker_setup.sh line 169 does `systemctl restart NetworkManager`
+        # after a cluster config reset, and the rest of the script needs
+        # nmcli to be live immediately afterwards.
+        if [ "$cmd" = "restart" ]; then
+            pkill -x NetworkManager 2>/dev/null
+            sleep 1
+            /usr/local/sbin/start-nm.py
+            for i in $(seq 1 15); do
+                if nmcli general status >/dev/null 2>&1; then
+                    echo "NetworkManager restarted after ${i}s"
+                    exit 0
+                fi
+                sleep 1
+            done
+            exit 1
+        fi
+        # `stop` / `disable` / `enable` / `reload` just kill; the entrypoint
+        # will not auto-restart it.
+        pkill -x NetworkManager 2>/dev/null
+    fi
+    if [ "${1:-}" = "docker" ]; then
+        if [ "$cmd" = "restart" ]; then
+            pkill -x dockerd 2>/dev/null
+            pkill -x containerd 2>/dev/null
+            sleep 2
+            # Re-launch via the same logic as `start`.
+            umount /var/run/docker.sock 2>/dev/null || true
+            umount -l /var/lib/docker 2>/dev/null || true
+            rm -f /var/run/docker.pid /var/run/docker.sock
+            mkdir -p /var/lib/docker-inner
+            nohup /usr/bin/dockerd \
+                --host=unix:///var/run/docker.sock \
+                --storage-driver=vfs \
+                --data-root=/var/lib/docker-inner \
+                --exec-root=/var/run/docker \
+                > /var/log/dockerd.log 2>&1 &
+            disown
+            for i in $(seq 1 20); do
+                if [ -S /var/run/docker.sock ] && timeout 2 docker info >/dev/null 2>&1; then
+                    echo "docker daemon restarted after ${i}s"
+                    exit 0
+                fi
+                sleep 1
+            done
+            exit 1
+        fi
+        # `stop` / `disable` / `enable` just kill dockerd.
+        pkill -x dockerd 2>/dev/null
+        pkill -x containerd 2>/dev/null
+        rm -f /var/run/docker.pid
     fi
     exit 0
     ;;
@@ -248,8 +384,15 @@ echo "[zfs] seed files ready"
 # only containers started by this ZFS node, not all host containers).
 # ────────────────────────────────────────────────────────────────────────
 echo "[zfs] setting up Docker-in-Docker…"
-# Unmount host socket so dockerd can claim it
+# Full isolation from the host's docker daemon:
+#   1. Unmount the host's docker socket so dockerd creates its own.
+#   2. Unmount the host's /var/lib/docker (mounted by docker-compose) so the
+#      container cannot accidentally read/write the host's docker graph root.
+#      The DinD uses /var/lib/docker-inner instead.
+# `-l` does a lazy umount: succeeds even if the path is busy with overlays,
+# detaches it from the filesystem tree, and cleans up once references drop.
 umount /var/run/docker.sock 2>/dev/null || true
+umount -l /var/lib/docker 2>/dev/null || true
 # Ensure dockerd graph root is writable (isolated from host's /var/lib/docker)
 mkdir -p /var/lib/docker-inner
 
@@ -257,22 +400,71 @@ echo "[zfs] starting dockerd (Docker-in-Docker)…"
 # Use an isolated graph root so dockerd has no conflicts with the host's docker.
 # /var/lib/docker-inner is local to this container; the host's /var/lib/docker
 # mount is ignored (unmounted above). VFS driver avoids ZFS kernel module deps.
+
+# Clean up stale pidfile/socket/containerd state from a previous container run.
+# dockerd refuses to start when /var/run/docker.pid references a "running"
+# process — after `docker stop`, the old PID file survives in the image's
+# overlay layer, and the new container's PID namespace may assign that same
+# number to an unrelated process, which dockerd then mistakes for a live daemon.
+# /var/run/docker/containerd also keeps a containerd-shim/bolt DB lock from the
+# previous run, which is enough to make `containerd` exit with "signal: killed"
+# during the very first milliseconds of startup. Removing both before launch
+# makes every fresh start deterministic.
+rm -f /var/run/docker.pid /var/run/docker.sock
+rm -rf /var/run/docker
+rm -rf /var/lib/docker-inner/containerd /var/lib/docker-inner/tmp
+mkdir -p /var/lib/docker-inner
+
 nohup /usr/bin/dockerd \
   --host=unix:///var/run/docker.sock \
   --storage-driver=vfs \
   --data-root=/var/lib/docker-inner \
   --exec-root=/var/run/docker \
   > /var/log/dockerd.log 2>&1 &
+DOCKERD_PID=$!
 
-# Wait for dockerd to be ready (up to 30s)
+# Wait for dockerd to be ready (up to 30s). If the first attempt fails (the
+# containerd-start race is most likely on a cold boot of the image), wipe the
+# stale state once and try one more time before giving up.
 echo "[zfs] waiting for dockerd to start…"
+STARTED=0
 for i in $(seq 1 30); do
     if /usr/bin/docker info >/dev/null 2>&1; then
         echo "[zfs] dockerd ready after ${i}s"
+        STARTED=1
         break
     fi
     sleep 1
 done
+
+if [ $STARTED -eq 0 ]; then
+    echo "[zfs] dockerd did not start on first attempt; cleaning state and retrying…"
+    kill -9 $DOCKERD_PID 2>/dev/null || true
+    pkill -9 -x dockerd 2>/dev/null || true
+    pkill -9 -x containerd 2>/dev/null || true
+    sleep 1
+    rm -f /var/run/docker.pid /var/run/docker.sock
+    rm -rf /var/run/docker
+    rm -rf /var/lib/docker-inner/containerd /var/lib/docker-inner/tmp
+    nohup /usr/bin/dockerd \
+      --host=unix:///var/run/docker.sock \
+      --storage-driver=vfs \
+      --data-root=/var/lib/docker-inner \
+      --exec-root=/var/run/docker \
+      > /var/log/dockerd.log 2>&1 &
+    disown
+    for i in $(seq 1 30); do
+        if /usr/bin/docker info >/dev/null 2>&1; then
+            echo "[zfs] dockerd ready after retry (${i}s)"
+            STARTED=1
+            break
+        fi
+        sleep 1
+    done
+    if [ $STARTED -eq 0 ]; then
+        echo "[zfs] WARNING: dockerd failed to start after retry; check /var/log/dockerd.log"
+    fi
+fi
 
 # ────────────────────────────────────────────────────────────────────────
 # Start services
@@ -287,6 +479,78 @@ echo "[zfs] starting crond…"
 
 echo "[zfs] starting sshd…"
 /usr/sbin/sshd
+
+# ────────────────────────────────────────────────────────────────────────
+# D-Bus system bus — required by NetworkManager. There is no systemd in
+# this container, so we launch dbus-daemon manually. Idempotent: if the
+# socket already exists and answers, we leave it alone.
+#
+# `--nofork` keeps dbus-daemon in the foreground but in its own session
+# (the wrapper's `&` + `disown` detaches it from bash's job table, so it
+# survives the wrapper exiting). `--address` pins the socket path so we
+# know exactly what to wait for.
+# ────────────────────────────────────────────────────────────────────────
+echo "[zfs] starting dbus system bus…"
+mkdir -p /run/dbus /var/lib/dbus /var/run/NetworkManager /var/lib/NetworkManager
+if [ ! -S /run/dbus/system_bus_socket ] || ! dbus-send --system \
+        --dest=org.freedesktop.DBus --type=method_call --print-reply \
+        /org/freedesktop/DBus org.freedesktop.DBus.ListNames \
+        >/dev/null 2>&1; then
+    # Clean any stale pid/socket from a previous container incarnation.
+    rm -f /run/dbus/pid /var/run/dbus/pid /run/dbus/system_bus_socket
+    # Double-fork via subshell so dbus-daemon is reparented to PID 1 and
+    # survives the entrypoint shell continuing. `setsid` puts it in its
+    # own session so any signals to the entrypoint's process group miss it.
+    cat > /usr/local/sbin/start-dbus.sh <<'DBS'
+#!/bin/bash
+exec setsid dbus-daemon --system --nofork \
+    --address=unix:path=/run/dbus/system_bus_socket \
+    >>/var/log/dbus.log 2>&1 </dev/null
+DBS
+    chmod 755 /usr/local/sbin/start-dbus.sh
+    ( /usr/local/sbin/start-dbus.sh & )
+    # Wait up to 10s for the socket to appear and start responding.
+    for i in $(seq 1 10); do
+        if dbus-send --system --dest=org.freedesktop.DBus --type=method_call \
+                --print-reply /org/freedesktop/DBus \
+                org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+fi
+if dbus-send --system --dest=org.freedesktop.DBus --type=method_call \
+        --print-reply /org/freedesktop/DBus \
+        org.freedesktop.DBus.ListNames >/dev/null 2>&1; then
+    echo "[zfs] dbus is up"
+else
+    echo "[zfs] WARNING: dbus did not start — NetworkManager will fail" >&2
+fi
+
+# ────────────────────────────────────────────────────────────────────────
+# NetworkManager — required for the nmcli calls in docker_setup.sh.
+# Started directly (no systemd in the container); idempotent.
+# Same setsid trick as dbus — bare nohup & silently dies.
+# ────────────────────────────────────────────────────────────────────────
+echo "[zfs] starting NetworkManager…"
+systemctl start NetworkManager
+if systemctl is-active NetworkManager >/dev/null 2>&1; then
+    echo "[zfs] NetworkManager is up"
+else
+    echo "[zfs] WARNING: NetworkManager did not come up — nmcli will fail" >&2
+fi
+
+# ────────────────────────────────────────────────────────────────────────
+# Rename any pre-existing bond0 (kernel-level, not NM-managed) to eth10 so
+# the app's NetworkManager-created bond0/bond1/etc. have the name free.
+# (eth0 is taken by the Docker network interface.)
+# ────────────────────────────────────────────────────────────────────────
+if ip link show bond0 >/dev/null 2>&1; then
+    echo "[zfs] renaming existing bond0 → eth10 to free the name for NM bonds…"
+    ip link set bond0 down 2>/dev/null || true
+    ip link set bond0 name eth10 2>/dev/null && echo "[zfs] bond0 renamed to eth10" || \
+        echo "[zfs] WARNING: could not rename bond0 (may be in use or no CARRIER)"
+fi
 
 # ────────────────────────────────────────────────────────────────────────
 # docker_setup.sh — runs automatically on every start (like rc.local)

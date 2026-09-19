@@ -33,6 +33,7 @@ RUN dnf -y install \
         samba \
         nfs-utils \
         iputils \
+        dbus-daemon \
         NetworkManager \
         firewalld \
         udev \
@@ -119,6 +120,7 @@ RUN echo 'root:Abdoadmin' | chpasswd \
 EXPOSE 22
 
 COPY scripts/entrypoint-zfs.sh /usr/local/bin/entrypoint.sh
-RUN chmod 755 /usr/local/bin/entrypoint.sh
+COPY scripts/start-nm.py      /usr/local/sbin/start-nm.py
+RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/sbin/start-nm.py
 
 CMD ["/usr/local/bin/entrypoint.sh"]

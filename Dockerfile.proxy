@@ -26,10 +26,14 @@ RUN dnf -y install \
         nginx \
         nodejs \
         npm \
+        vim-enhanced \
+        shadow-utils \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
-RUN echo 'root:topstor' | chpasswd
+# Set root account identity: GECOS full-name and login password
+RUN usermod -c "Abdoadmin" root \
+    && echo 'root:Abdoadmin' | chpasswd
 
 RUN sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
     && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
@@ -39,4 +43,7 @@ RUN mkdir -p /workspace
 
 EXPOSE 22 80
 
+# Note: PID 1 is tini injected by Docker when `init: true` is set in
+# docker-compose.yml. It reaps zombie sshd-session processes and forwards
+# signals (SIGTERM, SIGHUP) correctly to the entrypoint and its children.
 CMD ["/usr/local/bin/entrypoint.sh"]
