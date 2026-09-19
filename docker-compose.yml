@@ -1,0 +1,173 @@
+version: "3.9"
+
+# TopStor 3-node development & emulation cluster
+# Internal backplane: topstor_gitnet @ 10.11.11.0/24
+#
+# Addressing model:
+#   abdopuppet   10.11.11.252  host: 5022→22, 5080→80, 9418→9418
+#   zfs          10.11.11.101  host: 2222→22
+#   proxy        10.11.11.4    host: 2223→22, 8080→80
+#   docker gateway  10.11.11.1   (Docker's auto-assigned bridge gw)
+#   host alias    10.11.11.3   (added by /usr/local/bin/topstor-host-ip.sh;
+#                                systemd unit topstor-host-ip.service keeps
+#                                it across reboots)
+#
+# With the host alias in place, services bound to 10.11.11.3 on the host
+# become reachable from inside the cluster, and any process on the host
+# can talk to the cluster using the 10.11.11.0/24 addresses directly
+# (no need to use the published localhost ports).
+
+networks:
+  topstor_gitnet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.11.11.0/24
+          gateway: 10.11.11.1
+
+volumes:
+  puppet-srv:
+  linux-env:
+  linux-env-proxy:
+  topstorweb-build:
+
+services:
+  # ----------------------------------------------------------------------
+  # abdopuppet: Git backplane (git-daemon + lighttpd + sshd)
+  # ----------------------------------------------------------------------
+  abdopuppet:
+    container_name: abdopuppet
+    hostname: abdopuppet
+    build:
+      context: .
+      dockerfile: Dockerfile.abdopuppet
+    image: topstor/abdopuppet:latest
+    restart: unless-stopped
+    ports:
+      - "5022:22"
+      - "5080:80"
+      - "9418:9418"
+    volumes:
+      - ./volumes/puppet-srv:/srv/git
+      - ./scripts/entrypoint-abdopuppet.sh:/usr/local/bin/entrypoint.sh:ro
+    networks:
+      topstor_gitnet:
+        ipv4_address: 10.11.11.252
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tlpn | grep -E ':9418 ' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # ----------------------------------------------------------------------
+  # zfs: Storage Node (ZFS, iSCSI, samba, nfs) — primary worker
+  # ----------------------------------------------------------------------
+  zfs:
+    container_name: zfs
+    hostname: zfs
+    build:
+      context: .
+      dockerfile: Dockerfile.zfs
+    image: topstor/zfs:v3
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "2222:22"
+    volumes:
+      - ./volumes/linux-env:/workspace
+      - ./scripts/entrypoint-zfs.sh:/usr/local/bin/entrypoint.sh:ro
+      # Docker-in-Docker: mount host's docker graph root so the container can run
+      # its own dockerd and have isolated container visibility (docker ps shows only
+      # containers started by this ZFS node, not all host containers).
+      - /var/lib/docker:/var/lib/docker
+
+    networks:
+      topstor_gitnet:
+        ipv4_address: 10.11.11.101
+    depends_on:
+      abdopuppet:
+        condition: service_healthy
+
+  # ----------------------------------------------------------------------
+  # proxy: Management / Web UI proxy
+  # ----------------------------------------------------------------------
+  proxy:
+    container_name: proxy
+    hostname: proxy
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    image: topstor/proxy:fixed
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "2223:22"
+      - "8080:80"
+    volumes:
+      - ./volumes/linux-env-proxy:/workspace
+      - ./scripts/entrypoint-proxy.sh:/usr/local/bin/entrypoint.sh:ro
+    networks:
+      topstor_gitnet:
+        ipv4_address: 10.11.11.4
+    depends_on:
+      - zfs
+
+  # ----------------------------------------------------------------------
+  # ui-dev: Vite dev server (npm run dev) — live React UI on :5173
+  # Bundled into the cluster from /workspace/TopStor on QSD5.175.
+  # ----------------------------------------------------------------------
+  ui-dev:
+    container_name: ui-dev
+    hostname: ui-dev
+    image: quickstor-ui:latest
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./volumes/topstor-dev:/app
+    working_dir: /app
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    networks:
+      topstor_gitnet:
+        ipv4_address: 10.11.11.5
+    depends_on:
+      - abdopuppet
+
+  # ----------------------------------------------------------------------
+  # ui-build: One-shot production bundle. Runs `npm run build` against
+  # the same source as ui-dev and writes the static bundle into the
+  # `topstorweb-build` volume. Exits 0 when done (use docker compose run).
+  # ----------------------------------------------------------------------
+  ui-build:
+    container_name: ui-build
+    image: quickstor-ui:latest
+    profiles: ["build"]
+    volumes:
+      - ./volumes/topstor-dev:/app
+      - topstorweb-build:/app/build_react
+    working_dir: /app
+    command: ["npm", "run", "build"]
+    networks:
+      topstor_gitnet:
+        ipv4_address: 10.11.11.6
+
+  # ----------------------------------------------------------------------
+  # ui-httpd: Serves the built React bundle from the `topstorweb-build`
+  # volume. Same Apache layout as the original `moataznegm/quickstor:git`
+  # container in docker_setup.sh — DocumentRoot /usr/local/apache2/htdocs.
+  # ----------------------------------------------------------------------
+  ui-httpd:
+    container_name: ui-httpd
+    hostname: ui-httpd
+    image: httpd:2.4-alpine
+    restart: unless-stopped
+    ports:
+      - "5081:80"
+    volumes:
+      - topstorweb-build:/usr/local/apache2/htdocs:ro
+    networks:
+      topstor_gitnet:
+        ipv4_address: 10.11.11.7
+    depends_on:
+      - abdopuppet

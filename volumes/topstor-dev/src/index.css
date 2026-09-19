@@ -1,0 +1,308 @@
+@import "tailwindcss";
+
+@theme {
+    --font-sans: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-mono: "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+
+    --color-brand-50: #EEF1FD;
+    --color-brand-100: #DCE1FB;
+    --color-brand-200: #BAC4F6;
+    --color-brand-300: #97A6F1;
+    --color-brand-400: #6E83EC;
+    --color-brand-500: #495BE2;
+    --color-brand-600: #3746CC;
+    --color-brand-700: #2D39A6;
+    --color-brand-800: #252F85;
+    --color-brand-900: #1F286B;
+    --color-brand: #495BE2;
+
+    --color-gray-50: #F7F9FB;
+    --color-gray-100: #EFF2F6;
+    --color-gray-200: #E2E7EE;
+    --color-gray-300: #CBD3DE;
+    --color-gray-400: #97A2B2;
+    --color-gray-500: #69748A;
+    --color-gray-600: #4B5567;
+    --color-gray-700: #38414F;
+    --color-gray-800: #232A35;
+    --color-gray-900: #151A22;
+
+    --color-surface: #FFFFFF;
+    --color-surface-muted: #F7F9FB;
+    --color-surface-sunken: #EFF2F6;
+    --color-border: #E2E7EE;
+    --color-border-strong: #CBD3DE;
+    --color-canvas: #F1F4F8;
+
+    --color-success-50: #ECF8F2;
+    --color-success-100: #D3EFE1;
+    --color-success-500: #1F9D6B;
+    --color-success-600: #198257;
+    --color-success-700: #146646;
+
+    --color-warning-50: #FDF6EC;
+    --color-warning-100: #FAE9CC;
+    --color-warning-500: #C77A12;
+    --color-warning-600: #A6640D;
+    --color-warning-700: #84500B;
+
+    --color-danger-50: #FCEDED;
+    --color-danger-100: #F8D6D6;
+    --color-danger-500: #D64545;
+    --color-danger-600: #B83838;
+    --color-danger-700: #962E2E;
+
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius-2xl: 16px;
+
+    --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.04);
+    --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+    --shadow-md: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+    --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.08);
+    --shadow-xl: 0 12px 32px rgba(16, 24, 40, 0.10);
+}
+
+:root {
+    --brand-blue: #495BE2;
+    --brand-blue-dark: #3746CC;
+    --sidebar-bg-start: rgba(248, 249, 252, 0.9);
+    --sidebar-bg-end: rgba(235, 240, 255, 0.85);
+    --sidebar-item-active-bg: #495BE2;
+    --sidebar-text: #4A4A68;
+    --sidebar-text-active: #FFFFFF;
+    --submenu-bg: rgba(175, 175, 213, 0.09);
+}
+
+.main-sidebar.sidebar-glass {
+    background: linear-gradient(180deg, var(--sidebar-bg-start) 0%, var(--sidebar-bg-end) 100%) !important;
+    backdrop-filter: blur(30px) saturate(200%);
+    -webkit-backdrop-filter: blur(30px) saturate(200%);
+    border-right: 1px solid rgba(255, 255, 255, 0.6);
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.04);
+}
+
+.sidebar {
+    padding: 2px 12px 0 12px !important;
+    overflow-x: hidden !important;
+    box-sizing: border-box;
+}
+
+.sidebar .nav-sidebar .nav-link {
+    color: var(--sidebar-text) !important;
+    border-radius: 14px !important;
+    margin-bottom: 8px !important;
+    transition: all 0.2s ease-in-out;
+    padding: 12px 18px !important;
+    border: 1px solid transparent;
+    font-weight: 500;
+    width: 100% !important;
+}
+
+.sidebar .nav-sidebar .nav-link:not(.active):hover {
+    background-color: var(--submenu-bg) !important;
+    color: var(--brand-blue) !important;
+}
+
+/* Active Heading (Parent) - Now subtle, matching sub-menu bg */
+.sidebar .nav-sidebar>.nav-item.menu-open>.nav-link.active {
+    background-color: var(--submenu-bg) !important;
+    color: var(--brand-blue) !important;
+    box-shadow: none !important;
+    margin-bottom: 0 !important;
+    border-bottom-left-radius: 0 !important;
+    border-bottom-right-radius: 0 !important;
+}
+
+.sidebar .nav-sidebar>.nav-item.menu-open>.nav-link.active i {
+    color: var(--brand-blue) !important;
+}
+
+/* Sub-menu block */
+.sidebar .nav-treeview {
+    background-color: var(--submenu-bg) !important;
+    margin: 0 0 12px 0 !important;
+    padding: 8px 0 !important;
+    border-radius: 0 0 14px 14px !important;
+    border: 1px solid rgba(0, 0, 0, 0.03) !important;
+    border-top: 1px solid rgba(0, 0, 0, 0.05) !important;
+    box-shadow: 0 8px 15px rgba(0, 0, 0, 0.02);
+}
+
+/* Generic active style fallback (mostly for top-level if no children) */
+.sidebar .nav-sidebar .nav-item>.nav-link.active {
+    color: var(--brand-blue) !important;
+}
+
+/* ACTIVE Sub-menu Item - Now the only one using brand blue bg */
+.sidebar .nav-treeview .nav-link.active {
+    background-color: var(--brand-blue) !important;
+    color: #fff !important;
+    font-weight: 700;
+    box-shadow: 0 8px 16px rgba(73, 91, 226, 0.25);
+    border-radius: 10px !important;
+}
+
+.sidebar .nav-treeview .nav-link.active i,
+.sidebar .nav-treeview .nav-link.active p {
+    color: #fff !important;
+    opacity: 1;
+}
+
+/* Nested Sub-menu items (inactive) */
+.sidebar .nav-treeview .nav-link {
+    color: var(--sidebar-text) !important;
+    border-radius: 10px !important;
+    font-size: 0.85rem !important;
+    padding-left: 2.5rem !important;
+    margin: 2px 15px !important;
+    background-color: transparent !important;
+    width: auto !important;
+}
+
+.sidebar .nav-treeview .nav-link:not(.active):hover {
+    background-color: rgba(69, 88, 252, 0.05) !important;
+    color: var(--brand-blue) !important;
+}
+
+.sidebar .nav-treeview .nav-link i {
+    color: var(--sidebar-text) !important;
+    opacity: 0.7;
+}
+
+.brand-link {
+    border-bottom: 1px solid rgba(0, 0, 0, 0.04) !important;
+    margin-bottom: 0.5rem !important;
+    padding: 12px 25px !important;
+}
+
+.nav-sidebar .nav-header {
+    color: #8E8EA8 !important;
+    font-size: 0.7rem !important;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    padding: 0.8rem 1.4rem 0.4rem !important;
+    font-weight: 800;
+}
+
+.sidebar .form-inline {
+    width: 100% !important;
+}
+
+.sidebar .form-inline .input-group {
+    width: 100% !important;
+}
+
+.sidebar .form-inline .input-group input {
+    width: 100% !important;
+}
+
+/* Floating Canvas Layout */
+body,
+.wrapper,
+.content-wrapper {
+    background-color: #F8FAFC !important;
+}
+
+.floating-canvas {
+    background-color: #ffffff;
+    border-radius: 24px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.04);
+    margin: 1.5rem;
+    /* Gap from sidebar and edges */
+    padding: 2rem;
+    /* Internal spacing */
+    min-height: calc(100vh - 3rem - 60px);
+    /* Adjust based on navbar/footer */
+    position: relative;
+    border: 1px solid rgba(0, 0, 0, 0.02);
+}
+
+/* Ensure content header doesn't have weird padding inside the canvas */
+.floating-canvas .content-header {
+    padding: 0 0 1rem 0 !important;
+}
+
+/* Remove default background from content-wrapper if any */
+.content-wrapper {
+    background: transparent !important;
+}
+
+/* Shell redesign overrides */
+body {
+    background: var(--color-canvas);
+}
+
+/* The legacy adminlte.min.css ships an unlayered HTML5-element reset rule
+   (article, aside, ..., header, ..., nav, section { display: block; }).
+   Unlayered CSS always wins over Tailwind v4's @layer utilities regardless
+   of selector specificity, which silently strips the flex/flex-col layout
+   from these semantic shell elements. Restore it explicitly here (plain,
+   unlayered CSS placed after the legacy stylesheet in the cascade). */
+.app-sidebar,
+.app-navbar,
+.app-breadcrumb {
+    display: flex;
+}
+
+.app-sidebar {
+    transition: transform .25s ease;
+}
+
+.main-content-shell {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgba(21, 26, 34, .45);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity .25s ease, visibility .25s ease;
+}
+
+@media (min-width: 1024px) {
+    .main-content-shell {
+        flex: 0 0 calc(100% - 260px);
+        max-width: calc(100% - 260px);
+    }
+
+    .sidebar-backdrop {
+        display: none;
+    }
+
+    body.sidebar-collapse .app-sidebar {
+        transform: translateX(-100%);
+    }
+
+    body.sidebar-collapse .main-content-shell {
+        flex-basis: 100%;
+        max-width: 100%;
+        margin-left: 0 !important;
+    }
+}
+
+@media (max-width: 1023.98px) {
+    .app-sidebar {
+        transform: translateX(-100%);
+        box-shadow: var(--shadow-lg);
+    }
+
+    body.sidebar-mobile-open .app-sidebar {
+        transform: translateX(0);
+    }
+
+    body.sidebar-mobile-open .sidebar-backdrop {
+        opacity: 1;
+        visibility: visible;
+    }
+
+    .main-content-shell {
+        margin-left: 0 !important;
+    }
+}

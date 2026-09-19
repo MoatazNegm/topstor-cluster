@@ -1,0 +1,72 @@
+#!/bin/bash
+# systemctl wrapper — provides container-safe implementations for scripts that
+# expect systemd (docker_setup.sh).  "is-active" returns proper exit codes so
+# caller wait-loops (while [ $? -ne 0 ]) work correctly.
+#
+# Exit code convention (matching systemd):
+#   0  = active/running
+#   3  = inactive/not running
+#   4  = unknown (unhandled service)
+
+cmd="${1:-}"; shift   # peel off the verb
+
+case "$cmd" in
+  start)
+    # "start rabbitmq-server" or "start rabbitmq-server &" (backgrounded)
+    svc="${1:-}"
+    if [ "$svc" = "rabbitmq-server" ]; then
+        pgrep -f beam.smp >/dev/null 2>&1 && echo "RabbitMQ already running" || \
+          (nohup /opt/rabbitmq/sbin/rabbitmq-server > /var/log/rabbitmq.log 2>&1 &
+           echo $! > /run/rabbitmq-server.pid)
+        exit 0
+    fi
+    # Other start targets: iscsid/target/docker — silently succeed in container
+    exit 0
+    ;;
+
+  is-active)
+    svc="${1:-}"
+    if [ "$svc" = "rabbitmq-server" ]; then
+        if pgrep -f beam.smp >/dev/null 2>&1; then
+            echo "active"; exit 0
+        else
+            echo "inactive"; exit 3
+        fi
+    fi
+    echo "inactive"; exit 4
+    ;;
+
+  status)
+    svc="${1:-}"
+    if [ "$svc" = "rabbitmq-server" ]; then
+        if pgrep -f beam.smp >/dev/null 2>&1; then
+            echo "rabbitmq-server is running"; exit 0
+        else
+            echo "rabbitmq-server is not running"; exit 3
+        fi
+    fi
+    # Unknown service — try real systemctl, then fail gracefully
+    if command -v /usr/bin/systemctl >/dev/null 2>&1; then
+        exec /usr/bin/systemctl status "$@"
+    fi
+    echo "rabbitmq-server is not running"; exit 3
+    ;;
+
+  stop|disable|enable|restart|reload)
+    # These are not supported in a container without systemd.
+    # For rabbitmq we at least kill the process.
+    if [ "${1:-}" = "rabbitmq-server" ]; then
+        pkill -f beam.smp 2>/dev/null; rm -f /run/rabbitmq-server.pid
+    fi
+    exit 0
+    ;;
+
+  *)
+    # Unknown verb — delegate to real systemctl if available
+    if command -v /usr/bin/systemctl >/dev/null 2>&1; then
+        exec /usr/bin/systemctl "$@"
+    fi
+    echo "systemctl: not supported in container (unhandled: $cmd $*)" >&2
+    exit 1
+    ;;
+esac

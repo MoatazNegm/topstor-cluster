@@ -1,0 +1,124 @@
+# zfs: Storage Node (ZFS, iSCSI, samba, nfs)
+# Rocky Linux 9 base; full TopStor worker stack.
+# All runtime fixes (ZFS libs, rabbitmq, cronie, etcdctl) baked in.
+
+FROM rockylinux:9
+
+ENV container=docker \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    PATH="/opt/erlang/bin:/opt/rabbitmq/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# ─── Stage 1: Install base packages ────────────────────────────────────────────
+RUN dnf -y install \
+        epel-release \
+    && dnf -y install \
+        git \
+        openssh-server \
+        openssh-clients \
+        python3 \
+        python3-pip \
+        net-tools \
+        iproute \
+        procps-ng \
+        which \
+        hostname \
+        ca-certificates \
+        tar \
+        gzip \
+        findutils \
+        sudo \
+        targetcli \
+        iscsi-initiator-utils \
+        samba \
+        nfs-utils \
+        iputils \
+        NetworkManager \
+        firewalld \
+        udev \
+        vim-minimal \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# ─── Stage 2: Copy pre-seeded tool archives (from host build context) ─────────
+# zfs-tools.tar.gz   — ZFS userspace (zfs, zpool, libs) built from source on host
+# etcdctl            — static etcd client binary
+# cronie-crond      — cron daemon from host /usr/sbin/crond
+# cronie-crontab    — crontab binary from host /usr/bin/crontab
+# erlang-rabbitmq.tar.gz — Erlang OTP + RabbitMQ server extracted from official
+#                          rabbitmq:3.12-management container image
+COPY zfs-tools.tar.gz    /tmp/zfs-tools.tar.gz
+COPY etcdctl             /usr/local/bin/etcdctl
+COPY cronie-crond        /usr/sbin/crond
+COPY cronie-crontab      /usr/bin/crontab
+COPY erlang-rabbitmq.tar.gz /tmp/erlang-rabbitmq.tar.gz
+RUN chmod 755 /usr/local/bin/etcdctl /usr/sbin/crond /usr/bin/crontab
+
+# ─── Stage 3: Extract ZFS userspace + libs ────────────────────────────────────
+RUN tar -xzf /tmp/zfs-tools.tar.gz -C / && \
+    rm -f /tmp/zfs-tools.tar.gz && \
+    ldconfig
+
+# Create soname symlinks for ZFS libs
+RUN cd /usr/local/lib && \
+    ln -sf libzfs.so.7.0.0 libzfs.so.7 && \
+    ln -sf libzfs_core.so.3.0.0 libzfs_core.so.3 && \
+    ln -sf libuutil.so.3.0.0 libuutil.so.3 && \
+    ln -sf libnvpair.so.3.1.0 libnvpair.so.3 && \
+    ln -sf libzpool.so.7.0.0 libzpool.so.7
+
+# Tell dynamic linker where to find ZFS libs
+RUN echo '/usr/local/lib' > /etc/ld.so.conf.d/local.conf && ldconfig
+
+# ─── Stage 4b: Python pika for RabbitMQ client (pace Python scripts) ───────────
+RUN pip3 install --no-cache-dir --break-system-packages pika || pip3 install --no-cache-dir pika || echo "pika install failed, will retry at runtime"
+
+# ─── Stage 4: Extract Erlang + RabbitMQ ───────────────────────────────────────
+# RabbitMQ requires Erlang OTP; both are bundled in the official container image.
+# The tarball was created inside the container so all symlinks are preserved.
+RUN tar -xzf /tmp/erlang-rabbitmq.tar.gz -C / && \
+    rm -f /tmp/erlang-rabbitmq.tar.gz && \
+    # Patch RabbitMQ scripts that call 'erl' directly to use full path
+    # (rabbitmq-server and rabbitmqctl use 'erl' without PATH)
+    sed -i 's|^exec erl|exec /opt/erlang/bin/erl|' /opt/rabbitmq/sbin/rabbitmq-server && \
+    sed -i 's|^erl=erl|erl=/opt/erlang/bin/erl|' /opt/rabbitmq/sbin/rabbitmq-env
+
+# Install Docker CE (dockerd + docker CLI) for Docker-in-Docker isolation.
+# Binaries are pre-copied from the host to avoid network install issues.
+COPY docker-binaries.tar.gz /tmp/docker-binaries.tar.gz
+RUN tar -xzf /tmp/docker-binaries.tar.gz -C /tmp \
+    && mv /tmp/docker-binaries/docker /usr/bin/ \
+    && mv /tmp/docker-binaries/dockerd /usr/bin/ \
+    && mv /tmp/docker-binaries/docker-proxy /usr/bin/ \
+    && mv /tmp/docker-binaries/containerd /usr/bin/ \
+    && mv /tmp/docker-binaries/containerd-shim-runc-v2 /usr/bin/ \
+    && mv /tmp/docker-binaries/runc /usr/bin/ \
+    && mkdir -p /usr/libexec/docker \
+    && mv /tmp/docker-binaries/docker-init /usr/libexec/docker/ \
+    && rm -rf /tmp/docker-binaries /tmp/docker-binaries.tar.gz \
+    && chmod 755 /usr/bin/docker /usr/bin/dockerd /usr/bin/docker-proxy \
+                  /usr/bin/containerd /usr/bin/containerd-shim-runc-v2 /usr/bin/runc \
+    && chmod 755 /usr/libexec/docker/docker-init \
+    && ldconfig
+
+# Remove podman docker-compat env scripts that override DOCKER_HOST and break
+# the host's docker socket mount inside the container ( Rocky Linux 9 ships
+# these by default; they are not needed here ).
+RUN rm -f /etc/profile.d/podman-docker.sh /etc/profile.d/podman-docker.csh
+
+# Add Erlang and RabbitMQ bin directories to system PATH for all users
+RUN echo 'export PATH=/opt/erlang/bin:/opt/rabbitmq/sbin:$PATH' > /etc/profile.d/erlang-rabbitmq.sh
+
+# ─── Stage 5: SSH + locale ────────────────────────────────────────────────────
+RUN echo 'root:Abdoadmin' | chpasswd \
+    && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && ssh-keygen -A \
+    && mkdir -p /workspace
+
+EXPOSE 22
+
+COPY scripts/entrypoint-zfs.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh
+
+CMD ["/usr/local/bin/entrypoint.sh"]
