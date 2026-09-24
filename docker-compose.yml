@@ -66,16 +66,28 @@ services:
   zfs:
     container_name: zfs
     hostname: zfs
-    # No `build:` block — use the patched image topstor/zfs:v3-patched instead
+    # No `build:` block — use the pre-built image topstor/zfs:current instead
     # of rebuilding from Dockerfile.zfs. The build step pulls packages from
-    # the internet (dnf install), which we want to avoid here. The patched
-    # image was produced with `docker commit` from a container running the
-    # updated entrypoint-zfs.sh and captures every in-place fix we have
-    # made (docker stale-pidfile cleanup, retry on containerd race, etc.)
-    # without re-fetching any RPMs.
-    image: topstor/zfs:v3-patched
+    # the internet (dnf install), which we want to avoid here. The `:current`
+    # tag is the canonical mirror of `moataznegm/topstor-zfs:v3-patched`
+    # (sha256 528283e1edd5a1c860e7f60eaf5439289af39ef659744419bc025e7d2c766966).
+    # Flip back to `:v3-patched` if you need the literal version, or to
+    # `moataznegm/topstor-zfs:current` to pull from Hub at runtime.
+    image: moataznegm/topstor-zfs:current
     restart: unless-stopped
     privileged: true
+    # `init: true` injects Docker's bundled `docker-init` (tini) as PID 1.
+    # This is the single biggest improvement for reboot behavior: tini
+    # forwards SIGTERM/SIGINT/SIGHUP to its child (the entrypoint) and
+    # reaps zombies, so `kill -TERM 1` (or `docker stop zfs`) cleanly
+    # exits the entrypoint instead of being silently swallowed by bash.
+    # Combined with `stop_timeout: 30`, container shutdown becomes a
+    # proper graceful exit + Docker restart policy cycle, which is the
+    # exact analog of a physical power-cycle at the container level.
+    init: true
+    # Compose-schema-correct spelling. Translates to `docker run --stop-timeout`
+    # so Docker gives the entrypoint 30 s to shut down gracefully before SIGKILL.
+    stop_grace_period: 30s
     ports:
       - "2222:22"
     volumes:
@@ -85,8 +97,19 @@ services:
       # its own dockerd and have isolated container visibility (docker ps shows only
       # containers started by this ZFS node, not all host containers).
       - /var/lib/docker:/var/lib/docker
+      # Persistent cluster state — was previously on the container's overlay
+      # filesystem, which meant container recreation lost ports/bootdiskf/etc.
+      # Now on a host bind-mount so recreating zfs preserves cluster state.
+      - ./volumes/linux-env/TopStordata:/TopStordata
       # Flag file to prevent docker_setup.sh from auto-running on container start.
       - ./volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro
+      # Host-backed Docker image cache:
+      #   zfs-docker-images/  — read-only tarballs pre-saved on the host (source of truth)
+      #   zfs-docker-data/    — RW DinD graph root + exec root, all on the host
+      #                        so the zfs image overlay stays slim even with
+      #                        dozens of large moataznegm/* images loaded.
+      - ./volumes/zfs-docker-images:/docker-images:ro
+      - ./volumes/zfs-docker-data:/docker-data
 
     networks:
       topstor_gitnet:

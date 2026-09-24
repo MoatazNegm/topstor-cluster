@@ -37,3 +37,10 @@ volumes/linux-env-proxy/
 .DS_Store
 *.swp
 *.bak
+# Local compose backups (created by manage.sh and similar)
+docker-compose.yml.bak.*
+docker-compose.yml.*~
+# zfs container runtime state (bind-mount source)
+volumes/linux-env/TopStordata/
+# zfs DinD graph root (host-backed)
+volumes/zfs-docker-data/

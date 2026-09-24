@@ -107,12 +107,14 @@ case "$cmd" in
         umount -l /var/lib/docker 2>/dev/null || true
         # Clean up stale pidfile/socket from a crashed previous run.
         rm -f /var/run/docker.pid /var/run/docker.sock
-        mkdir -p /var/lib/docker-inner
+        rm -rf /var/run/docker
+        rm -rf /docker-data/containerd /docker-data/tmp /docker-data/exec 2>/dev/null || true
+        mkdir -p /docker-data
         nohup /usr/bin/dockerd \
             --host=unix:///var/run/docker.sock \
             --storage-driver=vfs \
-            --data-root=/var/lib/docker-inner \
-            --exec-root=/var/run/docker \
+            --data-root=/docker-data \
+            --exec-root=/docker-data/exec \
             > /var/log/dockerd.log 2>&1 &
         disown
         for i in $(seq 1 20); do
@@ -222,12 +224,14 @@ case "$cmd" in
             umount /var/run/docker.sock 2>/dev/null || true
             umount -l /var/lib/docker 2>/dev/null || true
             rm -f /var/run/docker.pid /var/run/docker.sock
-            mkdir -p /var/lib/docker-inner
+            rm -rf /var/run/docker
+            rm -rf /docker-data/containerd /docker-data/tmp /docker-data/exec 2>/dev/null || true
+            mkdir -p /docker-data
             nohup /usr/bin/dockerd \
                 --host=unix:///var/run/docker.sock \
                 --storage-driver=vfs \
-                --data-root=/var/lib/docker-inner \
-                --exec-root=/var/run/docker \
+                --data-root=/docker-data \
+                --exec-root=/docker-data/exec \
                 > /var/log/dockerd.log 2>&1 &
             disown
             for i in $(seq 1 20); do
@@ -388,18 +392,22 @@ echo "[zfs] setting up Docker-in-Docker…"
 #   1. Unmount the host's docker socket so dockerd creates its own.
 #   2. Unmount the host's /var/lib/docker (mounted by docker-compose) so the
 #      container cannot accidentally read/write the host's docker graph root.
-#      The DinD uses /var/lib/docker-inner instead.
+#      The DinD uses /docker-data (a host bind-mount) for both --data-root
+#      and --exec-root; images loaded from /docker-images live entirely on
+#      host disk and never enter this container's overlay.
 # `-l` does a lazy umount: succeeds even if the path is busy with overlays,
 # detaches it from the filesystem tree, and cleans up once references drop.
 umount /var/run/docker.sock 2>/dev/null || true
 umount -l /var/lib/docker 2>/dev/null || true
-# Ensure dockerd graph root is writable (isolated from host's /var/lib/docker)
-mkdir -p /var/lib/docker-inner
+# Ensure dockerd graph root is writable (host bind-mount /docker-data)
+mkdir -p /docker-data
 
 echo "[zfs] starting dockerd (Docker-in-Docker)…"
-# Use an isolated graph root so dockerd has no conflicts with the host's docker.
-# /var/lib/docker-inner is local to this container; the host's /var/lib/docker
-# mount is ignored (unmounted above). VFS driver avoids ZFS kernel module deps.
+# Use an isolated graph root on host disk so dockerd has no conflicts with
+# the host's docker. /docker-data is bind-mounted from
+# /root/topstor/volumes/zfs-docker-data on the host; the host's
+# /var/lib/docker mount is ignored (unmounted above). VFS driver avoids
+# ZFS kernel module deps.
 
 # Clean up stale pidfile/socket/containerd state from a previous container run.
 # dockerd refuses to start when /var/run/docker.pid references a "running"
@@ -412,14 +420,14 @@ echo "[zfs] starting dockerd (Docker-in-Docker)…"
 # makes every fresh start deterministic.
 rm -f /var/run/docker.pid /var/run/docker.sock
 rm -rf /var/run/docker
-rm -rf /var/lib/docker-inner/containerd /var/lib/docker-inner/tmp
-mkdir -p /var/lib/docker-inner
+rm -rf /docker-data/containerd /docker-data/tmp /docker-data/exec 2>/dev/null || true
+mkdir -p /docker-data
 
 nohup /usr/bin/dockerd \
   --host=unix:///var/run/docker.sock \
   --storage-driver=vfs \
-  --data-root=/var/lib/docker-inner \
-  --exec-root=/var/run/docker \
+  --data-root=/docker-data \
+  --exec-root=/docker-data/exec \
   > /var/log/dockerd.log 2>&1 &
 DOCKERD_PID=$!
 
@@ -445,12 +453,13 @@ if [ $STARTED -eq 0 ]; then
     sleep 1
     rm -f /var/run/docker.pid /var/run/docker.sock
     rm -rf /var/run/docker
-    rm -rf /var/lib/docker-inner/containerd /var/lib/docker-inner/tmp
+    rm -rf /docker-data/containerd /docker-data/tmp /docker-data/exec 2>/dev/null || true
+    mkdir -p /docker-data
     nohup /usr/bin/dockerd \
       --host=unix:///var/run/docker.sock \
       --storage-driver=vfs \
-      --data-root=/var/lib/docker-inner \
-      --exec-root=/var/run/docker \
+      --data-root=/docker-data \
+      --exec-root=/docker-data/exec \
       > /var/log/dockerd.log 2>&1 &
     disown
     for i in $(seq 1 30); do
@@ -541,8 +550,10 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────
-# Rename any pre-existing bond0 (kernel-level, not NM-managed) to eth10 so
-# the app's NetworkManager-created bond0/bond1/etc. have the name free.
+# Free the bond0 name (rename any existing kernel bond → eth10) and then
+# wire eth10 to the *inner* docker's default bridge (docker0 / "bridge"
+# network) as an IP-less device. /TopStor/ensure_eth10_bridge0.sh is
+# fully idempotent, so re-runs on every container start are safe.
 # (eth0 is taken by the Docker network interface.)
 # ────────────────────────────────────────────────────────────────────────
 if ip link show bond0 >/dev/null 2>&1; then
@@ -551,6 +562,9 @@ if ip link show bond0 >/dev/null 2>&1; then
     ip link set bond0 name eth10 2>/dev/null && echo "[zfs] bond0 renamed to eth10" || \
         echo "[zfs] WARNING: could not rename bond0 (may be in use or no CARRIER)"
 fi
+
+echo "[zfs] ensuring eth10 (no IP) is a port of inner docker's bridge (docker0)…"
+/TopStor/ensure_eth10_bridge0.sh || echo "[zfs] WARNING: ensure_eth10_bridge0.sh failed"
 
 # ────────────────────────────────────────────────────────────────────────
 # docker_setup.sh — runs automatically on every start (like rc.local)
@@ -563,6 +577,23 @@ if [ ! -f /tmp/docker_setup_disabled ]; then
     echo "[zfs] docker_setup.sh running as PID $DOCKER_SETUP_PID"
 else
     echo "[zfs] docker_setup.sh auto-run disabled"
+fi
+
+# ────────────────────────────────────────────────────────────────────────
+# Preload Docker images from /docker-images/ (host-backed tarballs)
+# into the DinD graph root at /docker-data (also host-backed). Runs
+# after dockerd is up and before any docker_setup.sh invocation, so the
+# image set required by docker_setup.sh is locally available regardless
+# of whether auto-run is enabled. The script is idempotent: re-runs
+# short-circuit on already-loaded images.
+# ────────────────────────────────────────────────────────────────────────
+if [ -d /docker-images ] && [ -x /TopStor/docker-preload.sh ]; then
+    echo "[zfs] running docker-preload.sh (host-backed image cache)…"
+    /TopStor/docker-preload.sh
+elif [ -d /docker-images ]; then
+    echo "[zfs] /docker-images mounted but /TopStor/docker-preload.sh not executable; skipping preload"
+else
+    echo "[zfs] /docker-images not mounted; skipping preload"
 fi
 
 # Keep container alive
