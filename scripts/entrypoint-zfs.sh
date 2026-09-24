@@ -377,10 +377,31 @@ mkdir -p /TopStordata /root/gitrepo /root/etcddata
 touch /TopStordata/diskchange
 # Force-create each seed file atomically using tee
 echo "no"         | tee /root/nodeconfigured      > /dev/null
-echo "zfsnode"    | tee /root/hostname           > /dev/null
+# /root/hostname is intentionally NOT seeded here — the app sets it via the
+# docker_setup.sh reset flow (dhcpXXXXXX after a reset+reboot cycle), and
+# re-writing "zfsnode" on every start would clobber that.
+#echo "zfsnode"    | tee /root/hostname           > /dev/null
 echo "10.11.11.14" | tee /root/newipaddr        > /dev/null
 echo "nameserver 10.11.12.7" | tee /root/gitrepo/resolv.conf > /dev/null
 echo "[zfs] seed files ready"
+
+# Force /root/gitrepo/{httpd.conf,dnshosts} to be regular FILES.
+# Some provisioning paths leave them as directories, which makes bind-mounts
+# onto file targets (Apache httpd.conf, /etc/hosts) fail with
+# "not a directory: mount src=... onto a file". Idempotent: leaves real
+# configs in place, only replaces missing / empty / wrong-type entries.
+for f in /root/gitrepo/httpd.conf /root/gitrepo/dnshosts; do
+    if [ -d "$f" ]; then
+        echo "[zfs] removing stale directory at $f (must be a file)…"
+        rm -rf "$f"
+    fi
+done
+[ -s /root/gitrepo/httpd.conf ] || \
+    printf '# Apache httpd.conf placeholder\n# Replace with a real config; an empty file makes httpd-foreground abort.\n' \
+    > /root/gitrepo/httpd.conf
+[ -s /root/gitrepo/dnshosts ] || \
+    printf '127.0.0.1 localhost\n10.11.12.7 intdns\n' \
+    > /root/gitrepo/dnshosts
 
 # ────────────────────────────────────────────────────────────────────────
 # Docker-in-Docker: unmount the host's docker socket so this container can
@@ -474,6 +495,19 @@ if [ $STARTED -eq 0 ]; then
         echo "[zfs] WARNING: dockerd failed to start after retry; check /var/log/dockerd.log"
     fi
 fi
+
+# Ensure the isolated intdns bridge exists for the in-container DNS service.
+# The ZFS container runs its own dockerd (DinD), so this is a separate bridge
+# from the host's "bridge0" Docker network — same subnet (10.11.12.0/24) but
+# a different namespace, different daemon, and a different Linux device name
+# (br-intdns) to avoid any visual conflict with the host's bridge0.
+docker network inspect intdns-net >/dev/null 2>&1 || \
+    docker network create --driver=bridge \
+        --subnet=10.11.12.0/24 --gateway=10.11.12.1 \
+        --opt 'com.docker.network.bridge.name=br-intdns' \
+        --label 'purpose=intdns-isolated' \
+        --label 'managed_by=zfs-docker' \
+        intdns-net
 
 # ────────────────────────────────────────────────────────────────────────
 # Start services
