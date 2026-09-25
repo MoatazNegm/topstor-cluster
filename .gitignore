@@ -44,3 +44,19 @@ docker-compose.yml.*~
 volumes/linux-env/TopStordata/
 # zfs DinD graph root (host-backed)
 volumes/zfs-docker-data/
+
+# zfs container's persistent /root bind-mount source.
+# Holds runtime container state (hostname, nodeconfigured, etcddata, ssh keys,
+# bash history, erlang cookie, kickstart configs) — must NEVER be committed:
+#  - contains credentials (.erlang.cookie, kickstart password hashes)
+#  - contains host-specific history (.bash_history, .viminfo)
+#  - is ~1 GB and grows without bound from logs
+# The host directory itself is recreated from a clean container snapshot.
+volumes/linux-env/root/
+
+# Stale snapshot of an old TopStor checkout (bare git repo on disk, ~80 MB).
+# Not source-of-truth; left in place for rollback reference only.
+volumes/linux-env/TopStor.old/
+
+# Separate zfs test environment copy (~170 MB). Not part of the main cluster.
+volumes/zfs-test-env/

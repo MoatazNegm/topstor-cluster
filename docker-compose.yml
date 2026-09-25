@@ -65,7 +65,12 @@ services:
   # ----------------------------------------------------------------------
   zfs:
     container_name: zfs
-    hostname: zfs
+    # `hostname:` intentionally removed. Docker was reasserting "zfs" on every
+    # container restart, which clobbered whatever docker_setup.sh's reset flow
+    # (hostname dhcpXXXXXX) had just written. With no hostname directive,
+    # Docker leaves the kernel hostname unset at start, so the value written
+    # by `hostname <name>` inside the container survives restarts as long as
+    # the entrypoint and docker_setup.sh don't overwrite it.
     # No `build:` block — use the pre-built image topstor/zfs:current instead
     # of rebuilding from Dockerfile.zfs. The build step pulls packages from
     # the internet (dnf install), which we want to avoid here. The `:current`
@@ -101,6 +106,22 @@ services:
       # filesystem, which meant container recreation lost ports/bootdiskf/etc.
       # Now on a host bind-mount so recreating zfs preserves cluster state.
       - ./volumes/linux-env/TopStordata:/TopStordata
+      # Persistent /root — same reasoning as TopStordata. The zfs container
+      # writes plenty of state under /root (myhostname, hostname, nodeconfigured,
+      # nodestatus, etcddata, gitrepo, ssh keys, bash history, log files...) and
+      # recreating the container used to wipe all of it. Bind-mounting the
+      # container's /root onto a host directory keeps that state across
+      # `docker compose up`, image rebuilds, and any container recreation.
+      # Seeded on the host from the previous container's overlay before this
+      # mount was added (see volumes/linux-env/root/).
+      - ./volumes/linux-env/root:/root
+      # NetworkManager conf.d snippets — drop-in configs that NetworkManager
+      # merges into its main config. We use this to set hostname-mode=none so
+      # NM stops rewriting /etc/hostname from DHCP option 12 every time
+      # `nmcli conn up` runs (see volumes/linux-env/etc-networkmanager-conf.d/
+      # for the actual snippets). Read-only so the container can't mutate
+      # host source.
+      - ./volumes/linux-env/etc-networkmanager-conf.d:/etc/NetworkManager/conf.d:ro
       # Flag file to prevent docker_setup.sh from auto-running on container start.
       - ./volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro
       # Host-backed Docker image cache:
