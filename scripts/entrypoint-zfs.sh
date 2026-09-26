@@ -169,13 +169,23 @@ case "$cmd" in
         fi
     fi
     if [ "$svc" = "iscsid" ] || [ "$svc" = "iscsi" ]; then
-        # Rocky 9 iscsid (iscsi-initiator-utils 6.2.x) under `-f` does
-        # not write /var/run/iscsid.pid; we test the live process instead.
+        # Two liveness signals, in priority order:
+        #   1. /var/run/iscsid.pid (when iscsid was started without -f,
+        #      i.e. via the standard double-fork — the path used by the
+        #      entrypoint launcher).
+        #   2. pgrep iscsid — covers the rare case where iscsid was
+        #      started under `-f` (no pidfile) and is still running.
+        # The AF_UNIX management socket itself is in the abstract
+        # namespace (@ISCSIADM_ABSTRACT_NAMESPACE) on Rocky 9, so we
+        # cannot check the filesystem socket path.
+        if [ -f /var/run/iscsid.pid ] \
+           && kill -0 "$(cat /var/run/iscsid.pid)" 2>/dev/null; then
+            echo "active"; exit 0
+        fi
         if pgrep -x iscsid >/dev/null 2>&1; then
             echo "active"; exit 0
-        else
-            echo "inactive"; exit 3
         fi
+        echo "inactive"; exit 3
     fi
     echo "inactive"; exit 4
     ;;
@@ -204,11 +214,14 @@ case "$cmd" in
         fi
     fi
     if [ "$svc" = "iscsid" ] || [ "$svc" = "iscsi" ]; then
+        if [ -f /var/run/iscsid.pid ] \
+           && kill -0 "$(cat /var/run/iscsid.pid)" 2>/dev/null; then
+            echo "iscsid is running"; exit 0
+        fi
         if pgrep -x iscsid >/dev/null 2>&1; then
             echo "iscsid is running"; exit 0
-        else
-            echo "iscsid is not running"; exit 3
         fi
+        echo "iscsid is not running"; exit 3
     fi
     # Unknown service — try real systemctl, then fail gracefully
     if command -v /usr/bin/systemctl >/dev/null 2>&1; then
@@ -226,7 +239,7 @@ case "$cmd" in
     if [ "${1:-}" = "iscsid" ] || [ "${1:-}" = "iscsi" ]; then
         # stop/disable/enable/reload: kill the daemon.
         pkill -x iscsid 2>/dev/null
-        rm -f /var/run/iscsid.pid /var/run/iscsid
+        rm -f /var/run/iscsid.pid
         # restart: kill, then re-launch via the same logic as `start`.
         if [ "$cmd" = "restart" ]; then
             if [ -x /usr/local/sbin/start-iscsid.sh ]; then
@@ -435,13 +448,6 @@ mkdir -p /var/run /var/lib/iscsi /var/lib/iscsi/nodes \
 # iscsid creates the AF_UNIX socket at /var/run/iscsid only if the parent
 # dir exists; clean any stale socket/pidfile from a previous incarnation.
 rm -f /var/run/iscsid /var/run/iscsid.pid
-# Rocky 9 iscsid (iscsi-initiator-utils 6.2.x) in `-f` mode does NOT
-# write /var/run/iscsid.pid and does NOT bind /var/run/iscsid on this
-# image. Readiness is therefore observed as "the iscsid process is alive
-# AND has been so for at least 2s" (long enough to have completed its
-# initial config read). iscsiadm itself will still connect — earlier it
-# confirmed a working discovery against 10.11.11.18:3266 in this exact
-# setup — so the daemon is functional even without those on-disk artefacts.
 # Clear any stale iSCSI DB lock files. iscsiadm/iscsid take a write lock
 # via O_CREAT|O_EXCL on /run/lock/iscsi/lock.write; if a previous
 # container crashed mid-transaction the file survives and the next
@@ -453,39 +459,44 @@ for lockf in /run/lock/iscsi/lock.write /run/lock/iscsi/lock.read; do
         rm -f "$lockf"
     fi
 done
-# iscsid uses systemd-style notify messages on the AF_UNIX socket; dbus
-# must already be running by the time the entrypoint calls us.
-( setsid /usr/sbin/iscsid -f </dev/null >/var/log/iscsid.log 2>&1 & )
-# Wait up to 30s. Readiness = iscsid proc has been alive for >= 2s. We do
-# NOT require /var/run/iscsid.pid or /var/run/iscsid because this Rocky
-# build doesn't create either under `-f`; a "still alive after 2s" check
-# is sufficient (a process that exits during init fails this).
-STARTED_PID=""
+# IMPORTANT: do NOT pass `-f` (foreground) to iscsid in this container.
+# Without `-f`, iscsid does the standard double-fork dance and binds the
+# AF_UNIX management socket at /var/run/iscsid plus writes a pidfile at
+# /var/run/iscsid.pid. Both are required by `iscsiadm -m node -l`
+# (login): iscsiadm talks to iscsid over that socket, iscsid then
+# performs the kernel-side login via netlink. With `-f` the socket is
+# never created and login fails with "iscsid: sendmsg: bug? ctrl_fd 4",
+# killing iscsid. Discovery (`-m discovery`) still works under `-f`
+# because iscsiadm just opens a TCP connection to the target directly.
+#
+# Use setsid so iscsid is in its own session (signal-safe) and redirect
+# fds so the launcher can exit cleanly.
+/usr/sbin/iscsid </dev/null >/var/log/iscsid.log 2>&1 &
+ISC_PID=$!
+# Wait up to 30s. Rocky 9 iscsid (iscsi-initiator-utils 6.2.x) binds its
+# AF_UNIX management socket in the *abstract* namespace, not at
+# /var/run/iscsid (visible in /proc/net/unix as
+# `@ISCSIADM_ABSTRACT_NAMESPACE`). So we can NOT use the filesystem
+# socket as the readiness signal. We use the pidfile + liveness instead
+# — iscsid writes /var/run/iscsid.pid very early in startup, so once
+# that PID has been alive >= 2s the management socket is bound (either
+# filesystem or abstract) and iscsiadm can connect.
 for i in $(seq 1 30); do
-    PID=$(pgrep -x iscsid | head -n1)
-    if [ -n "$PID" ]; then
-        # Has this PID been alive for at least 2s?
-        ETIME=$(awk '{print $1}' /proc/$PID/stat 2>/dev/null)  # starttime (jiffies)
-        NOW=$(awk '{print $1}' /proc/uptime 2>/dev/null)
-        if [ -n "$ETIME" ] && [ -n "$NOW" ]; then
-            # Use ps for a robust elapsed-seconds read instead.
-            ELAPSED=$(ps -o etimes= -p "$PID" 2>/dev/null | tr -d ' ')
+    if [ -f /var/run/iscsid.pid ]; then
+        DPID=$(cat /var/run/iscsid.pid 2>/dev/null)
+        if [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null; then
+            ELAPSED=$(ps -o etimes= -p "$DPID" 2>/dev/null | tr -d ' ')
             if [ -n "$ELAPSED" ] && [ "$ELAPSED" -ge 2 ]; then
-                STARTED_PID="$PID"
-                echo "iscsid started after ${i}s (pid=$PID)"
-                break
+                echo "iscsid started after ${i}s (pid=$DPID)"
+                exit 0
             fi
         fi
     fi
     sleep 1
 done
-if [ -n "$STARTED_PID" ]; then
-    exit 0
-fi
 echo "iscsid failed to start within 30s; see /var/log/iscsid.log" >&2
-# Don't leave a half-started process around.
 pkill -x iscsid 2>/dev/null
-rm -f /var/run/iscsid.pid /var/run/iscsid
+rm -f /var/run/iscsid.pid
 exit 1
 ISD
 chmod 755 /usr/local/sbin/start-iscsid.sh
