@@ -111,7 +111,15 @@ RUN rm -f /etc/profile.d/podman-docker.sh /etc/profile.d/podman-docker.csh
 RUN echo 'export PATH=/opt/erlang/bin:/opt/rabbitmq/sbin:$PATH' > /etc/profile.d/erlang-rabbitmq.sh
 
 # ─── Stage 5: SSH + locale ────────────────────────────────────────────────────
-RUN echo 'root:Abdoadmin' | chpasswd \
+# Seed a default InitiatorName so `iscsiadm -m discovery` works on a brand
+# new container (the seed file may be replaced by the host provisioner at
+# runtime; if not, we still don't fail with "Initiatorname required").
+# The format iqn.YYYY-MM.<reversed domain>:<unique> is the iSCSI standard.
+RUN mkdir -p /etc/iscsi \
+    && [ -s /etc/iscsi/initiatorname.iscsi ] || \
+       printf 'InitiatorName=iqn.1994-05.com.redhat:topstor-zfs-default\n' \
+            > /etc/iscsi/initiatorname.iscsi \
+    && echo 'root:Abdoadmin' | chpasswd \
     && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
     && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
     && ssh-keygen -A \

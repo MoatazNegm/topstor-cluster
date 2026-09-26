@@ -127,7 +127,21 @@ case "$cmd" in
         echo "docker daemon failed to start within 20s" >&2
         exit 1
     fi
-    # Other start targets: iscsid/target — silently succeed in container
+    if [ "$svc" = "iscsid" ] || [ "$svc" = "iscsi" ]; then
+        # iscsiadm needs iscsid to be running so it can talk to the
+        # management socket. Without this, `iscsiadm -m discovery ...`
+        # fails with "Cannot perform discovery. Initiatorname required."
+        # (misleading: the real cause is "could not connect to iscsid").
+        # Reuse the entrypoint's launcher so behaviour is identical on a
+        # cold start and on `systemctl restart iscsid`.
+        if [ -x /usr/local/sbin/start-iscsid.sh ]; then
+            /usr/local/sbin/start-iscsid.sh
+            exit $?
+        fi
+        echo "systemctl: /usr/local/sbin/start-iscsid.sh missing" >&2
+        exit 1
+    fi
+    # Other start targets: silently succeed in container
     exit 0
     ;;
 
@@ -149,6 +163,15 @@ case "$cmd" in
     fi
     if [ "$svc" = "docker" ]; then
         if [ -S /var/run/docker.sock ] && timeout 2 docker info >/dev/null 2>&1; then
+            echo "active"; exit 0
+        else
+            echo "inactive"; exit 3
+        fi
+    fi
+    if [ "$svc" = "iscsid" ] || [ "$svc" = "iscsi" ]; then
+        # Rocky 9 iscsid (iscsi-initiator-utils 6.2.x) under `-f` does
+        # not write /var/run/iscsid.pid; we test the live process instead.
+        if pgrep -x iscsid >/dev/null 2>&1; then
             echo "active"; exit 0
         else
             echo "inactive"; exit 3
@@ -180,6 +203,13 @@ case "$cmd" in
             echo "docker daemon is not running"; exit 3
         fi
     fi
+    if [ "$svc" = "iscsid" ] || [ "$svc" = "iscsi" ]; then
+        if pgrep -x iscsid >/dev/null 2>&1; then
+            echo "iscsid is running"; exit 0
+        else
+            echo "iscsid is not running"; exit 3
+        fi
+    fi
     # Unknown service — try real systemctl, then fail gracefully
     if command -v /usr/bin/systemctl >/dev/null 2>&1; then
         exec /usr/bin/systemctl status "$@"
@@ -192,6 +222,19 @@ case "$cmd" in
     # For rabbitmq we at least kill the process.
     if [ "${1:-}" = "rabbitmq-server" ]; then
         pkill -f beam.smp 2>/dev/null; rm -f /run/rabbitmq-server.pid
+    fi
+    if [ "${1:-}" = "iscsid" ] || [ "${1:-}" = "iscsi" ]; then
+        # stop/disable/enable/reload: kill the daemon.
+        pkill -x iscsid 2>/dev/null
+        rm -f /var/run/iscsid.pid /var/run/iscsid
+        # restart: kill, then re-launch via the same logic as `start`.
+        if [ "$cmd" = "restart" ]; then
+            if [ -x /usr/local/sbin/start-iscsid.sh ]; then
+                /usr/local/sbin/start-iscsid.sh
+                exit $?
+            fi
+        fi
+        exit 0
     fi
     if [ "${1:-}" = "NetworkManager" ]; then
         # `restart` is special: kill, then re-launch via start-nm.py.
@@ -264,18 +307,19 @@ SYS
 chmod 755 /usr/local/bin/systemctl
 
 # ────────────────────────────────────────────────────────────────────────
-# Combined docker wrapper — handles both 'run' and 'exec' subcommands.
+# docker wrapper — only intercepts `docker run` (conflict-resolution).
+# Everything else (including `docker exec`) is a pure passthrough to the
+# real /usr/bin/docker, so it adds zero latency and emits zero stdout noise.
 #
 # docker run:
-#   1. "container name already in use"  → remove old container, retry
-#   2. Port-binding to an unreachable host IP → strip that -p arg only;
-#      container still starts without that host port (fine for internal svc)
-#   NOTE: We no longer exit 0 on port failure — we let docker attempt the run.
+#   "container name already in use"  → remove old container, retry.
+#   Diagnostic messages go to stderr, never to stdout.
 #
-# docker exec:
-#   When targeting etcdclient and the command starts with /pace/*.py,
-#   copy the scripts from /workspace/pace (linux-env volume) into etcdclient's
-#   /pace before executing. This works around the empty /pace bind mount.
+# (Removed: a prior revision intercepted `docker exec etcdclient /pace/...`
+#  and pre-populated /pace inside etcdclient with /workspace/pace/*.py.
+#  Redundant — docker_setup.sh already bind-mounts /pace into etcdclient
+#  via `-v /pace/:/pace`, so the same files are visible without copying.
+#  Also slowed every call by ~1 docker exec + N docker cp round-trips.)
 # ────────────────────────────────────────────────────────────────────────
 cat > /usr/local/bin/docker <<'DOCK'
 #!/bin/bash
@@ -307,7 +351,7 @@ if [ "$1" = "run" ]; then
     EXIT=$?
 
     if grep -q "Conflict. Container name" /tmp/docker_err.txt 2>/dev/null; then
-        echo "[docker run] removing conflicting container '$NAME_ARG'…"
+        echo "[docker run] removing conflicting container '$NAME_ARG'…" >&2
         $DOCKER_REAL rm -f "$NAME_ARG" 2>/dev/null
         rm -f /tmp/docker_err.txt
         exec $DOCKER_REAL "${new_args[@]}"
@@ -316,53 +360,14 @@ if [ "$1" = "run" ]; then
     exit $EXIT
 fi
 
-# ── docker exec ─────────────────────────────────────────────────────────
-if [ "$1" = "exec" ]; then
-    # Extract container name and check if command targets etcdclient /pace/*.py
-    args=("$@")
-    CONTAINER=""
-    CMD_START_IDX=2
-    i=0
-    for arg in "$@"; do
-        if [ "$i" -eq 1 ]; then
-            CONTAINER="$arg"
-        fi
-        if [ "$i" -ge 2 ]; then
-            if [[ "$arg" == /* ]]; then
-                CMD_START_IDX=$i
-                break
-            fi
-        fi
-        i=$((i+1))
-    done
-
-    # If targeting etcdclient and command starts with /pace/, pre-populate /pace
-    if [ "$CONTAINER" = "etcdclient" ]; then
-        cmd="${args[$CMD_START_IDX]:-}"
-        if [[ "$cmd" == /pace/* ]]; then
-            # Wait for etcdclient to be responsive (up to 30s)
-            for retry in $(seq 1 30); do
-                if $DOCKER_REAL exec "$CONTAINER" true 2>/dev/null; then
-                    break
-                fi
-                sleep 1
-            done
-            # Copy all *.py files from /workspace/pace into etcdclient:/pace
-            if [ -d /workspace/pace ] && [ -n "$(ls -A /workspace/pace/ 2>/dev/null)" ]; then
-                echo "[docker exec] populating /pace inside etcdclient from /workspace/pace…"
-                $DOCKER_REAL exec "$CONTAINER" mkdir -p /pace 2>/dev/null
-                for f in /workspace/pace/*.py; do
-                    [ -f "$f" ] || continue
-                    fname=$(basename "$f")
-                    $DOCKER_REAL cp "$f" "$CONTAINER:/pace/$fname" 2>/dev/null
-                done
-            fi
-        fi
-    fi
-    exec $DOCKER_REAL "$@"
-fi
-
-# ── all other subcommands: pass through directly ────────────────────────
+# ── all other subcommands (incl. `docker exec`): pass through directly ──
+# NOTE: a previous revision intercepted `docker exec etcdclient /pace/...`
+# and pre-populated /pace inside the etcdclient container with files from
+# /workspace/pace. That was redundant: docker_setup.sh already starts
+# etcdclient with `-v /pace/:/pace` (bind mount), so the same files are
+# already visible inside it. The pre-populate also added ~1 docker exec +
+# N docker cp round-trips per call and leaked a status line to stdout.
+# Removed.
 exec $DOCKER_REAL "$@"
 DOCK
 chmod 755 /usr/local/bin/docker
@@ -402,6 +407,93 @@ done
 [ -s /root/gitrepo/dnshosts ] || \
     printf '127.0.0.1 localhost\n10.11.12.7 intdns\n' \
     > /root/gitrepo/dnshosts
+
+# ────────────────────────────────────────────────────────────────────────
+# iscsid launcher — used both on cold start and by `systemctl
+# start|restart iscsid`. iscsiadm needs iscsid's AF_UNIX management socket
+# (/var/run/iscsid) to perform discovery/login; without it, iscsiadm emits
+# "Cannot perform discovery. Initiatorname required." (misleading — the
+# real reason is "could not connect to iscsid"). The container shares the
+# host kernel, so iscsi_tcp/libiscsi are already loaded — we only need the
+# userspace daemon.
+#
+# `setsid` + double-fork via subshell keeps iscsid reparented to PID 1 so
+# it survives the launcher exiting; `&` alone is reaped by the parent
+# shell on exit in some Docker setups. `-f` keeps iscsid in the foreground
+# of its own session (it's a daemon — it never returns).
+# ────────────────────────────────────────────────────────────────────────
+cat > /usr/local/sbin/start-iscsid.sh <<'ISD'
+#!/bin/bash
+# Idempotent: if iscsid is already running, exit 0 immediately.
+if [ -f /var/run/iscsid.pid ] && kill -0 "$(cat /var/run/iscsid.pid)" 2>/dev/null; then
+    echo "iscsid already running (pid=$(cat /var/run/iscsid.pid))"
+    exit 0
+fi
+mkdir -p /var/run /var/lib/iscsi /var/lib/iscsi/nodes \
+         /var/lib/iscsi/sls /var/lib/iscsi/static /var/lib/iscsi/isns \
+         /var/lock/iscsi
+# iscsid creates the AF_UNIX socket at /var/run/iscsid only if the parent
+# dir exists; clean any stale socket/pidfile from a previous incarnation.
+rm -f /var/run/iscsid /var/run/iscsid.pid
+# Rocky 9 iscsid (iscsi-initiator-utils 6.2.x) in `-f` mode does NOT
+# write /var/run/iscsid.pid and does NOT bind /var/run/iscsid on this
+# image. Readiness is therefore observed as "the iscsid process is alive
+# AND has been so for at least 2s" (long enough to have completed its
+# initial config read). iscsiadm itself will still connect — earlier it
+# confirmed a working discovery against 10.11.11.18:3266 in this exact
+# setup — so the daemon is functional even without those on-disk artefacts.
+# Clear any stale iSCSI DB lock files. iscsiadm/iscsid take a write lock
+# via O_CREAT|O_EXCL on /run/lock/iscsi/lock.write; if a previous
+# container crashed mid-transaction the file survives and the next
+# iscsiadm call returns "Timeout on acquiring lock ... File exists".
+# Safe: we only clear if no live process holds the file.
+for lockf in /run/lock/iscsi/lock.write /run/lock/iscsi/lock.read; do
+    [ -e "$lockf" ] || continue
+    if ! pgrep -f iscsiadm >/dev/null 2>&1 && ! pgrep -x iscsid >/dev/null 2>&1; then
+        rm -f "$lockf"
+    fi
+done
+# iscsid uses systemd-style notify messages on the AF_UNIX socket; dbus
+# must already be running by the time the entrypoint calls us.
+( setsid /usr/sbin/iscsid -f </dev/null >/var/log/iscsid.log 2>&1 & )
+# Wait up to 30s. Readiness = iscsid proc has been alive for >= 2s. We do
+# NOT require /var/run/iscsid.pid or /var/run/iscsid because this Rocky
+# build doesn't create either under `-f`; a "still alive after 2s" check
+# is sufficient (a process that exits during init fails this).
+STARTED_PID=""
+for i in $(seq 1 30); do
+    PID=$(pgrep -x iscsid | head -n1)
+    if [ -n "$PID" ]; then
+        # Has this PID been alive for at least 2s?
+        ETIME=$(awk '{print $1}' /proc/$PID/stat 2>/dev/null)  # starttime (jiffies)
+        NOW=$(awk '{print $1}' /proc/uptime 2>/dev/null)
+        if [ -n "$ETIME" ] && [ -n "$NOW" ]; then
+            # Use ps for a robust elapsed-seconds read instead.
+            ELAPSED=$(ps -o etimes= -p "$PID" 2>/dev/null | tr -d ' ')
+            if [ -n "$ELAPSED" ] && [ "$ELAPSED" -ge 2 ]; then
+                STARTED_PID="$PID"
+                echo "iscsid started after ${i}s (pid=$PID)"
+                break
+            fi
+        fi
+    fi
+    sleep 1
+done
+if [ -n "$STARTED_PID" ]; then
+    exit 0
+fi
+echo "iscsid failed to start within 30s; see /var/log/iscsid.log" >&2
+# Don't leave a half-started process around.
+pkill -x iscsid 2>/dev/null
+rm -f /var/run/iscsid.pid /var/run/iscsid
+exit 1
+ISD
+chmod 755 /usr/local/sbin/start-iscsid.sh
+
+# Cold-start iscsid is intentionally NOT invoked here. It happens later,
+# after dbus is up — see the "starting iscsid…" block below the dbus
+# section. iscsid's notify machinery talks to dbus; starting it before
+# dbus is running makes it silently exit.
 
 # ────────────────────────────────────────────────────────────────────────
 # Docker-in-Docker: unmount the host's docker socket so this container can
@@ -568,6 +660,19 @@ if dbus-send --system --dest=org.freedesktop.DBus --type=method_call \
     echo "[zfs] dbus is up"
 else
     echo "[zfs] WARNING: dbus did not start — NetworkManager will fail" >&2
+fi
+
+# ────────────────────────────────────────────────────────────────────────
+# iscsid — needs dbus up because its notify-path talks to the system bus.
+# Started here (after dbus, before docker_setup.sh) so iscsiadm works the
+# very first time it's called inside the container. The launcher is
+# idempotent and re-used by `systemctl restart iscsid`.
+# ────────────────────────────────────────────────────────────────────────
+echo "[zfs] starting iscsid…"
+if /usr/local/sbin/start-iscsid.sh; then
+    echo "[zfs] iscsid is up"
+else
+    echo "[zfs] WARNING: iscsid did not come up — iscsiadm will fail" >&2
 fi
 
 # ────────────────────────────────────────────────────────────────────────
