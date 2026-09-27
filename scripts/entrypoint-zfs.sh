@@ -687,6 +687,57 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────
+# iscsid watchdog — restarts iscsid automatically when it dies.
+#
+# Why we need this:
+#   iscsi-initiator-utils 6.2.1.11 (the version in this image) crashes
+#   when the kernel reports an iSCSI login failure. The kernel iSCSI
+#   transport emits `rx_data returned 0, expecting 48` followed by
+#   `iSCSI Login negotiation failed.` when the target rejects the TCP
+#   connection mid-handshake (bad CHAP creds, IP not allowed, target
+#   not actually iSCSI on that port, etc.). iscsid then dies within
+#   ~200ms with `iscsid: sendmsg: bug? ctrl_fd 4` and the abstract
+#   namespace socket @ISCSIADM_ABSTRACT_NAMESPACE disappears. iscsiadm
+#   reports `read error (0/2), daemon died?`. The fix is upstream but
+#   not in any 6.2.x release.
+#
+#   Without a watchdog, the user has to manually `systemctl restart
+#   iscsid` after every failed login. With this watchdog, iscsid
+#   comes back within 3s of crashing, so the next iscsiadm call works.
+#
+#   Detection: `pgrep -x iscsid` matches either the parent or the
+#   daemon (both have argv[0] == "iscsid"). A live process means at
+#   least one of them is up. To detect the actual *daemon* we also
+#   require the abstract socket to be present; without it, iscsiadm
+#   can't connect, so the daemon is effectively dead even if a stale
+#   intermediate parent is still around.
+# ────────────────────────────────────────────────────────────────────────
+cat > /usr/local/sbin/iscsid-watchdog.sh <<'WGD'
+#!/bin/bash
+# iscsid watchdog. Runs forever; never exits. Logs restarts.
+set +e
+while true; do
+    if ! pgrep -x iscsid >/dev/null 2>&1; then
+        echo "$(date '+%F %T') iscsid-watchdog: iscsid not running, restarting" >> /var/log/iscsid.log
+        /usr/local/sbin/start-iscsid.sh >> /var/log/iscsid.log 2>&1
+    elif ! grep -q ISCSIADM_ABSTRACT_NAMESPACE /proc/net/unix 2>/dev/null; then
+        # Process alive but no abstract socket — iscsid 6.2.1.11 crash
+        # leaves an intermediate parent stuck in hrtimer_nanosleep with
+        # all fds closed. Kill everything iscsid-named and restart.
+        echo "$(date '+%F %T') iscsid-watchdog: iscsid alive but abstract socket missing, killing" >> /var/log/iscsid.log
+        pkill -9 -x iscsid 2>/dev/null
+        sleep 1
+        /usr/local/sbin/start-iscsid.sh >> /var/log/iscsid.log 2>&1
+    fi
+    sleep 3
+done
+WGD
+chmod 755 /usr/local/sbin/iscsid-watchdog.sh
+( setsid /usr/local/sbin/iscsid-watchdog.sh </dev/null >>/var/log/iscsid.log 2>&1 & )
+disown 2>/dev/null || true
+echo "[zfs] iscsid watchdog started (monitors every 3s)"
+
+# ────────────────────────────────────────────────────────────────────────
 # NetworkManager — required for the nmcli calls in docker_setup.sh.
 # Started directly (no systemd in the container); idempotent.
 # Same setsid trick as dbus — bare nohup & silently dies.
