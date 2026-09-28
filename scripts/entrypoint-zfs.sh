@@ -434,13 +434,40 @@ done
 # it survives the launcher exiting; `&` alone is reaped by the parent
 # shell on exit in some Docker setups. `-f` keeps iscsid in the foreground
 # of its own session (it's a daemon — it never returns).
+#
+# HOST NETWORK NAMESPACE (root-cause fix for "iscsid dies on every login"):
+# the kernel iSCSI control channel (NETLINK_ISCSI) exists only in the host
+# network namespace. An iscsid running in this container's private netns
+# can talk TCP to a target but cannot reach the kernel, so it dies at
+# login time ("iscsid: sendmsg: bug? ctrl_fd 4") and the target logs
+# "rx_data returned 0, expecting 48" because our connection closed without
+# a login PDU. Proven by A/B test: the same binary/container filesystem/
+# initiator name logs in 20/20 from the host netns and 0/20 from the
+# container netns. So iscsid (and iscsiadm — see the wrapper below) run via
+# `nsenter --net=/host-ns/net`; /host-ns/net is a bind-mount of the host's
+# /proc/1/ns/net (docker-compose.yml / manage.sh). Only one iscsid can exist
+# per host netns: keep iscsid.service/iscsid.socket disabled on the host.
+# If /host-ns/net is absent (old container definition) we fall back to the
+# container's own netns, i.e. the previous behaviour.
 # ────────────────────────────────────────────────────────────────────────
 cat > /usr/local/sbin/start-iscsid.sh <<'ISD'
 #!/bin/bash
+HNS=/host-ns/net
+if [ -e "$HNS" ]; then NSE="nsenter --net=$HNS"; else NSE=""; fi
+# Is iscsid's abstract management socket present in the netns iscsid lives in?
+alive()  { $NSE grep -q ISCSIADM_ABSTRACT_NAMESPACE /proc/net/unix 2>/dev/null; }
+launch() { $NSE /usr/sbin/iscsid </dev/null >/var/log/iscsid.log 2>&1 & }
 # Idempotent: if iscsid is already running, exit 0 immediately.
 if [ -f /var/run/iscsid.pid ] && kill -0 "$(cat /var/run/iscsid.pid)" 2>/dev/null; then
     echo "iscsid already running (pid=$(cat /var/run/iscsid.pid))"
     exit 0
+fi
+# The socket name is global to the netns: if it is taken but no iscsid of
+# ours exists, someone else (e.g. the host's iscsid.service) owns it and
+# we must not start a second one that would silently use the wrong initiator.
+if ! pgrep -x iscsid >/dev/null 2>&1 && alive; then
+    echo "another iscsid already owns @ISCSIADM_ABSTRACT_NAMESPACE in the shared netns (host iscsid.service/socket enabled?); refusing to start" >&2
+    exit 1
 fi
 mkdir -p /var/run /var/lib/iscsi /var/lib/iscsi/nodes \
          /var/lib/iscsi/sls /var/lib/iscsi/static /var/lib/iscsi/isns \
@@ -465,41 +492,74 @@ done
 # /var/run/iscsid.pid. Both are required by `iscsiadm -m node -l`
 # (login): iscsiadm talks to iscsid over that socket, iscsid then
 # performs the kernel-side login via netlink. With `-f` the socket is
-# never created and login fails with "iscsid: sendmsg: bug? ctrl_fd 4",
-# killing iscsid. Discovery (`-m discovery`) still works under `-f`
-# because iscsiadm just opens a TCP connection to the target directly.
+# never created and login fails, killing iscsid. Discovery (`-m
+# discovery`) still works because iscsiadm just opens a TCP connection to
+# the target directly.
 #
 # Use setsid so iscsid is in its own session (signal-safe) and redirect
 # fds so the launcher can exit cleanly.
-/usr/sbin/iscsid </dev/null >/var/log/iscsid.log 2>&1 &
-ISC_PID=$!
+launch
 # Wait up to 30s. Rocky 9 iscsid (iscsi-initiator-utils 6.2.x) binds its
 # AF_UNIX management socket in the *abstract* namespace, not at
 # /var/run/iscsid (visible in /proc/net/unix as
 # `@ISCSIADM_ABSTRACT_NAMESPACE`). So we can NOT use the filesystem
-# socket as the readiness signal. We use the pidfile + liveness instead
-# — iscsid writes /var/run/iscsid.pid very early in startup, so once
-# that PID has been alive >= 2s the management socket is bound (either
-# filesystem or abstract) and iscsiadm can connect.
-for i in $(seq 1 30); do
-    if [ -f /var/run/iscsid.pid ]; then
-        DPID=$(cat /var/run/iscsid.pid 2>/dev/null)
-        if [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null; then
-            ELAPSED=$(ps -o etimes= -p "$DPID" 2>/dev/null | tr -d ' ')
-            if [ -n "$ELAPSED" ] && [ "$ELAPSED" -ge 2 ]; then
-                echo "iscsid started after ${i}s (pid=$DPID)"
-                exit 0
+# socket as the readiness signal. We use the pidfile + liveness as the
+# first signal — iscsid writes /var/run/iscsid.pid very early in
+# startup — but that alone is not sufficient: iscsi-initiator-utils
+# 6.2.1.11 can crash its double-forked child within ~200ms of startup
+# (same bug as the login-negotiation crash — see the guardian below),
+# leaving a stuck parent that still holds the pidfile's PID alive via
+# kill -0 even though the abstract socket never bound. So we also
+# require the abstract socket to actually be present before declaring
+# success; if it never shows up, we kill and retry (up to 3 attempts)
+# instead of reporting a false "started" and leaving iscsiadm broken
+# for whoever calls it next.
+for attempt in 1 2 3; do
+    for i in $(seq 1 30); do
+        if [ -f /var/run/iscsid.pid ]; then
+            DPID=$(cat /var/run/iscsid.pid 2>/dev/null)
+            if [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null; then
+                ELAPSED=$(ps -o etimes= -p "$DPID" 2>/dev/null | tr -d ' ')
+                if [ -n "$ELAPSED" ] && [ "$ELAPSED" -ge 2 ] && alive; then
+                    echo "iscsid started after ${i}s (pid=$DPID, attempt=$attempt)"
+                    exit 0
+                fi
             fi
         fi
-    fi
+        sleep 1
+    done
+    echo "iscsid attempt $attempt: no abstract socket after 30s; killing and retrying" >&2
+    pkill -9 -x iscsid 2>/dev/null
+    rm -f /var/run/iscsid /var/run/iscsid.pid
     sleep 1
+    [ "$attempt" -lt 3 ] && launch
 done
-echo "iscsid failed to start within 30s; see /var/log/iscsid.log" >&2
-pkill -x iscsid 2>/dev/null
+echo "iscsid failed to start within 3 attempts; see /var/log/iscsid.log" >&2
+pkill -9 -x iscsid 2>/dev/null
 rm -f /var/run/iscsid.pid
 exit 1
 ISD
 chmod 755 /usr/local/sbin/start-iscsid.sh
+
+# iscsiadm wrapper — must run in the same (host) netns as iscsid, otherwise
+# it cannot find iscsid's abstract socket. Every caller (docker_setup.sh,
+# /pace/*.sh, interactive use) invokes /sbin/iscsiadm or `iscsiadm`, both of
+# which resolve to /usr/sbin/iscsiadm, so wrapping it here needs no change to
+# any app script. The real binary is kept as iscsiadm.real. Idempotent, and
+# also self-heals if an rpm update replaces the wrapper with a fresh binary.
+if [ -x /usr/sbin/iscsiadm ] && [ "$(head -c 2 /usr/sbin/iscsiadm 2>/dev/null)" != "#!" ]; then
+    mv -f /usr/sbin/iscsiadm /usr/sbin/iscsiadm.real
+fi
+cat > /usr/sbin/iscsiadm <<'IAD'
+#!/bin/bash
+# Runs the real iscsiadm in the host netns (see start-iscsid.sh).
+REAL=/usr/sbin/iscsiadm.real
+if [ -e /host-ns/net ]; then
+    exec nsenter --net=/host-ns/net "$REAL" "$@"
+fi
+exec "$REAL" "$@"
+IAD
+chmod 755 /usr/sbin/iscsiadm
 
 # Cold-start iscsid is intentionally NOT invoked here. It happens later,
 # after dbus is up — see the "starting iscsid…" block below the dbus
@@ -687,22 +747,20 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────────────
-# iscsid watchdog — restarts iscsid automatically when it dies.
+# iscsi guardian — restarts iscsid automatically when it dies.
 #
 # Why we need this:
-#   iscsi-initiator-utils 6.2.1.11 (the version in this image) crashes
-#   when the kernel reports an iSCSI login failure. The kernel iSCSI
-#   transport emits `rx_data returned 0, expecting 48` followed by
-#   `iSCSI Login negotiation failed.` when the target rejects the TCP
-#   connection mid-handshake (bad CHAP creds, IP not allowed, target
-#   not actually iSCSI on that port, etc.). iscsid then dies within
-#   ~200ms with `iscsid: sendmsg: bug? ctrl_fd 4` and the abstract
-#   namespace socket @ISCSIADM_ABSTRACT_NAMESPACE disappears. iscsiadm
-#   reports `read error (0/2), daemon died?`. The fix is upstream but
-#   not in any 6.2.x release.
+#   The original diagnosis here was an upstream iscsi-initiator-utils
+#   6.2.1.11 bug that kills iscsid on any login failure. That was wrong: the
+#   real cause was running iscsid in the container's private network
+#   namespace, which cannot reach the kernel's iSCSI netlink channel (see
+#   the HOST NETWORK NAMESPACE note above start-iscsid.sh). With iscsid in
+#   the host netns, logins no longer kill it. The guardian stays as a cheap
+#   safety net for any other way iscsid can die (OOM, operator kill, a
+#   stuck parent left with no abstract socket, ...).
 #
-#   Without a watchdog, the user has to manually `systemctl restart
-#   iscsid` after every failed login. With this watchdog, iscsid
+#   Without a guardian, the user has to manually `systemctl restart
+#   iscsid` after every failed login. With this guardian, iscsid
 #   comes back within 3s of crashing, so the next iscsiadm call works.
 #
 #   Detection: `pgrep -x iscsid` matches either the parent or the
@@ -711,20 +769,36 @@ fi
 #   require the abstract socket to be present; without it, iscsiadm
 #   can't connect, so the daemon is effectively dead even if a stale
 #   intermediate parent is still around.
+#
+#   Deliberately NOT named "iscsid-*": a comm/argv containing "iscsid"
+#   as a substring gets caught by a plain `pkill iscsid` / `killall
+#   iscsid` (no -x), which operators reach for when iscsid looks stuck.
+#   That silently kills the guardian along with the daemon it's meant
+#   to resurrect, and nothing was left running to bring iscsid back —
+#   exactly the "stays dead" failure this container hit in the field.
+#   "iscsi-guardian" contains no "iscsid" substring, so it survives.
+#
+#   Second line of defense: the guardian process itself can still die
+#   for unrelated reasons (OOM, an operator's `pkill -f`, whatever).
+#   A cron entry (crond already runs in this container) checks once a
+#   minute, independent of the guardian's own process tree, and
+#   relaunches it if it's gone — see below.
 # ────────────────────────────────────────────────────────────────────────
-cat > /usr/local/sbin/iscsid-watchdog.sh <<'WGD'
+cat > /usr/local/sbin/iscsi-guardian.sh <<'WGD'
 #!/bin/bash
-# iscsid watchdog. Runs forever; never exits. Logs restarts.
+# iscsi guardian. Runs forever; never exits. Logs restarts.
 set +e
+HNS=/host-ns/net
+if [ -e "$HNS" ]; then NSE="nsenter --net=$HNS"; else NSE=""; fi
 while true; do
     if ! pgrep -x iscsid >/dev/null 2>&1; then
-        echo "$(date '+%F %T') iscsid-watchdog: iscsid not running, restarting" >> /var/log/iscsid.log
+        echo "$(date '+%F %T') iscsi-guardian: iscsid not running, restarting" >> /var/log/iscsid.log
         /usr/local/sbin/start-iscsid.sh >> /var/log/iscsid.log 2>&1
-    elif ! grep -q ISCSIADM_ABSTRACT_NAMESPACE /proc/net/unix 2>/dev/null; then
+    elif ! $NSE grep -q ISCSIADM_ABSTRACT_NAMESPACE /proc/net/unix 2>/dev/null; then
         # Process alive but no abstract socket — iscsid 6.2.1.11 crash
         # leaves an intermediate parent stuck in hrtimer_nanosleep with
         # all fds closed. Kill everything iscsid-named and restart.
-        echo "$(date '+%F %T') iscsid-watchdog: iscsid alive but abstract socket missing, killing" >> /var/log/iscsid.log
+        echo "$(date '+%F %T') iscsi-guardian: iscsid alive but abstract socket missing, killing" >> /var/log/iscsid.log
         pkill -9 -x iscsid 2>/dev/null
         sleep 1
         /usr/local/sbin/start-iscsid.sh >> /var/log/iscsid.log 2>&1
@@ -732,10 +806,19 @@ while true; do
     sleep 3
 done
 WGD
-chmod 755 /usr/local/sbin/iscsid-watchdog.sh
-( setsid /usr/local/sbin/iscsid-watchdog.sh </dev/null >>/var/log/iscsid.log 2>&1 & )
+chmod 755 /usr/local/sbin/iscsi-guardian.sh
+( setsid /usr/local/sbin/iscsi-guardian.sh </dev/null >>/var/log/iscsid.log 2>&1 & )
 disown 2>/dev/null || true
-echo "[zfs] iscsid watchdog started (monitors every 3s)"
+echo "[zfs] iscsi guardian started (monitors every 3s)"
+
+# Cron safety net: if the guardian process itself ever disappears, crond
+# (independent of the guardian's own process tree, and already running
+# in this container) notices within a minute and relaunches it. Guard
+# against duplicate crontab entries across container restarts.
+( crontab -l 2>/dev/null | grep -v 'iscsi-guardian.sh'
+  echo "* * * * * pgrep -f /usr/local/sbin/iscsi-guardian.sh >/dev/null 2>&1 || (setsid /usr/local/sbin/iscsi-guardian.sh </dev/null >>/var/log/iscsid.log 2>&1 &)"
+) | crontab -
+echo "[zfs] iscsi-guardian cron safety net installed (checks every 60s)"
 
 # ────────────────────────────────────────────────────────────────────────
 # NetworkManager — required for the nmcli calls in docker_setup.sh.

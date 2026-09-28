@@ -1,5 +1,11 @@
 version: "3.9"
 
+# Force the project name to "topstor" so the network is named
+# `topstor_gitnet` instead of the default-prefixed `topstor_topstor_gitnet`.
+# This keeps docker-compose's network name in sync with manage.sh's
+# NETWORK_NAME="topstor_gitnet" so the two launchers can coexist.
+name: topstor
+
 # TopStor 3-node development & emulation cluster
 # Internal backplane: topstor_gitnet @ 10.11.11.0/24
 #
@@ -78,7 +84,12 @@ services:
     # (sha256 528283e1edd5a1c860e7f60eaf5439289af39ef659744419bc025e7d2c766966).
     # Flip back to `:v3-patched` if you need the literal version, or to
     # `moataznegm/topstor-zfs:current` to pull from Hub at runtime.
-    image: moataznegm/topstor-zfs:current
+    # `:fixed-rabb` is the live commit that has the patched docker_setup.sh
+    # (delete+add_user+verify, no more silent `2>/dev/null`) plus a freshly
+    # initialized rabbitmq mnesia with `rabb_Mezo / YousefNadody` on vhost `/`.
+    # Use this tag when the host changes so the new host comes up with the
+    # right broker credentials baked in.
+    image: ${ZFS_IMAGE:-moataznegm/topstor-zfs:current}
     restart: unless-stopped
     privileged: true
     # `init: true` injects Docker's bundled `docker-init` (tini) as PID 1.
@@ -124,6 +135,14 @@ services:
       - ./volumes/linux-env/etc-networkmanager-conf.d:/etc/NetworkManager/conf.d:ro
       # Flag file to prevent docker_setup.sh from auto-running on container start.
       - ./volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro
+      # Handle on the HOST network namespace. The kernel's iSCSI control
+      # channel (NETLINK_ISCSI) only exists in the host netns, so an iscsid
+      # running in this container's private netns dies on every login
+      # ("iscsid: sendmsg: bug? ctrl_fd"). The entrypoint starts iscsid — and
+      # the iscsiadm wrapper runs — via `nsenter --net=/host-ns/net`.
+      # Only ONE iscsid may run per host netns: keep iscsid.service/socket
+      # disabled on the host.
+      - /proc/1/ns/net:/host-ns/net
       # Host-backed Docker image cache:
       #   zfs-docker-images/  — read-only tarballs pre-saved on the host (source of truth)
       #   zfs-docker-data/    — RW DinD graph root + exec root, all on the host
@@ -131,6 +150,20 @@ services:
       #                        dozens of large moataznegm/* images loaded.
       - ./volumes/zfs-docker-images:/docker-images:ro
       - ./volumes/zfs-docker-data:/docker-data
+
+    # Three 10 GB virtual disks backed by sparse files under
+    # /home/topstor/disks/ and attached to host loop devices
+    # /dev/loop1..3. The host's losetup keeps them persistent across
+    # zfs container restarts; only the container sees them as
+    # block devices. To re-create them:
+    #   truncate -s 10G /home/topstor/disks/disk{1,2,3}.img
+    #   losetup /dev/loop1 /home/topstor/disks/disk1.img
+    #   losetup /dev/loop2 /home/topstor/disks/disk2.img
+    #   losetup /dev/loop3 /home/topstor/disks/disk3.img
+    devices:
+      - /dev/loop1:/dev/loop1
+      - /dev/loop2:/dev/loop2
+      - /dev/loop3:/dev/loop3
 
     networks:
       topstor_gitnet:

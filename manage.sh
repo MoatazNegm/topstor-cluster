@@ -27,7 +27,7 @@
 # container — DO NOT drop these:
 #   --privileged             keeps inner dockerd, nmcli, targetcli, etc.
 #   --init                   tini as PID 1, forwards SIGTERM to entrypoint
-#   --stop-timeout 30s       30s grace before Docker SIGKILLs on stop
+#   --stop-timeout 30        30s grace before Docker SIGKILLs on stop
 #   --restart unless-stopped exit -> restart -> cluster comes back
 #
 # Persistent bind-mounts (cluster state survives recreate):
@@ -38,6 +38,13 @@
 #   ./volumes/zfs-docker-data        -> /docker-data (DinD graph root)
 #   ./volumes/zfs-docker-images      -> /docker-images (RO image tarballs)
 #   ./volumes/zfs-tmp/docker_setup_disabled -> /tmp/docker_setup_disabled (flag)
+#
+# Virtual disks (host losetup + container --device):
+#   /home/topstor/disks/disk{1,2,3}.img -> /dev/loop{1,2,3} on host
+#                                          -> /dev/loop{1,2,3} in zfs container
+#   ensure_loop_disks() below is idempotent: creates the file if missing,
+#   attaches the loop if it isn't already pointing at the right file. Safe
+#   to call on every start.
 
 set +e
 
@@ -45,6 +52,7 @@ REPO_ROOT="/root/topstor"
 NETWORK_NAME="topstor_gitnet"
 NETWORK_SUBNET="10.11.11.0/24"
 NETWORK_GATEWAY="10.11.11.1"
+DISK_DIR="/home/topstor/disks"
 
 # Image registry + tags. Override by exporting these env vars before invoking.
 ABDOPUPPET_IMAGE="${ABDOPUPPET_IMAGE:-topstor/abdopuppet:latest}"
@@ -66,6 +74,29 @@ ensure_network() {
         --subnet "$NETWORK_SUBNET" \
         --gateway "$NETWORK_GATEWAY" \
         "$NETWORK_NAME"
+}
+
+# ----------------------------------------------------------------------------
+# ensure_loop_disks — make sure /dev/loop{1,2,3} on the host are attached to
+# 10 GB sparse files under $DISK_DIR. Idempotent: skips files that already
+# point at the right backing file; creates the file if it doesn't exist.
+# Called before run_zfs() so the container can mount the loop devices.
+# ----------------------------------------------------------------------------
+ensure_loop_disks() {
+    mkdir -p "$DISK_DIR"
+    for i in 1 2 3; do
+        img="$DISK_DIR/disk${i}.img"
+        dev="/dev/loop${i}"
+        if [ ! -f "$img" ]; then
+            echo "[manage] creating $img (10 GB sparse)"
+            truncate -s 10G "$img"
+        fi
+        current=$(losetup -l --noheadings -O BACK-FILE "$dev" 2>/dev/null | tr -d ' ' || true)
+        if [ "$current" != "$img" ]; then
+            echo "[manage] attaching $dev -> $img"
+            losetup "$dev" "$img"
+        fi
+    done
 }
 
 # ----------------------------------------------------------------------------
@@ -92,9 +123,14 @@ run_abdopuppet() {
 # run_zfs — storage node. The key flags for reboot.sh to work:
 #   --privileged        keeps inner dockerd, nmcli, targetcli working
 #   --init              tini as PID 1 — forwards SIGTERM, exit -> Docker restart
-#   --stop-timeout 30s  graceful 30s before SIGKILL
+#   --stop-timeout 30   graceful 30s before SIGKILL
 # ----------------------------------------------------------------------------
 run_zfs() {
+    # Three 10 GB virtual disks — host loops set up by ensure_loop_disks().
+    # Persistent across zfs restarts because the loops are host-side.
+    # /lib/modules is bind-mounted RO from the host so kernel modules
+    # (target_core_mod, iscsi_target_mod, etc.) load inside zfs. The
+    # kernel is shared with the host, so the host's modules just work.
     echo "[manage] starting zfs ($ZFS_IMAGE)"
     docker rm -f zfs >/dev/null 2>&1 || true
     docker run -d \
@@ -102,16 +138,23 @@ run_zfs() {
         --hostname zfs \
         --privileged \
         --init \
-        --stop-timeout 30s \
+        --stop-timeout 30 \
         --restart unless-stopped \
         -p 2222:22 \
         -v "$REPO_ROOT/volumes/linux-env:/workspace" \
         -v "$REPO_ROOT/scripts/entrypoint-zfs.sh:/usr/local/bin/entrypoint.sh:ro" \
         -v /var/lib/docker:/var/lib/docker \
         -v "$REPO_ROOT/volumes/linux-env/TopStordata:/TopStordata" \
+        -v "$REPO_ROOT/volumes/linux-env/root:/root" \
+        -v "$REPO_ROOT/volumes/linux-env/etc-networkmanager-conf.d:/etc/NetworkManager/conf.d:ro" \
         -v "$REPO_ROOT/volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro" \
+        -v /proc/1/ns/net:/host-ns/net \
         -v "$REPO_ROOT/volumes/zfs-docker-images:/docker-images:ro" \
         -v "$REPO_ROOT/volumes/zfs-docker-data:/docker-data" \
+        -v /lib/modules:/lib/modules:ro \
+        --device /dev/loop1:/dev/loop1 \
+        --device /dev/loop2:/dev/loop2 \
+        --device /dev/loop3:/dev/loop3 \
         --network "$NETWORK_NAME" \
         --ip 10.11.11.101 \
         "$ZFS_IMAGE"
@@ -144,6 +187,7 @@ run_proxy() {
 # ----------------------------------------------------------------------------
 start() {
     ensure_network
+    ensure_loop_disks
     run_abdopuppet
     run_zfs
     run_proxy
