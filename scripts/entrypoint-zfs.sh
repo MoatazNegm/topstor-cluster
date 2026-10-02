@@ -64,7 +64,7 @@ case "$cmd" in
   start)
     # "start rabbitmq-server" or "start rabbitmq-server &" (backgrounded)
     svc="${1:-}"
-    if [ "$svc" = "rabbitmq-server" ]; then
+    if [ "$svc" = "rabbitmq-server" ] || [ "$svc" = "rabbitmq" ]; then
         pgrep -f beam.smp >/dev/null 2>&1 && echo "RabbitMQ already running" || \
           (nohup /opt/rabbitmq/sbin/rabbitmq-server > /var/log/rabbitmq.log 2>&1 &
            echo $! > /run/rabbitmq-server.pid)
@@ -147,7 +147,7 @@ case "$cmd" in
 
   is-active)
     svc="${1:-}"
-    if [ "$svc" = "rabbitmq-server" ]; then
+    if [ "$svc" = "rabbitmq-server" ] || [ "$svc" = "rabbitmq" ]; then
         if pgrep -f beam.smp >/dev/null 2>&1; then
             echo "active"; exit 0
         else
@@ -192,7 +192,7 @@ case "$cmd" in
 
   status)
     svc="${1:-}"
-    if [ "$svc" = "rabbitmq-server" ]; then
+    if [ "$svc" = "rabbitmq-server" ] || [ "$svc" = "rabbitmq" ]; then
         if pgrep -f beam.smp >/dev/null 2>&1; then
             echo "rabbitmq-server is running"; exit 0
         else
@@ -232,9 +232,21 @@ case "$cmd" in
 
   stop|disable|enable|restart|reload)
     # These are not supported in a container without systemd.
-    # For rabbitmq we at least kill the process.
-    if [ "${1:-}" = "rabbitmq-server" ]; then
-        pkill -f beam.smp 2>/dev/null; rm -f /run/rabbitmq-server.pid
+    # For rabbitmq: stop kills the broker; restart kills it, waits for the
+    # BEAM to exit (so the new one doesn't hit a still-bound 5672), then
+    # relaunches it the same way `start` does.
+    if [ "${1:-}" = "rabbitmq-server" ] || [ "${1:-}" = "rabbitmq" ]; then
+        pkill -f beam.smp 2>/dev/null
+        for _ in $(seq 1 30); do
+            pgrep -f beam.smp >/dev/null 2>&1 || break
+            sleep 1
+        done
+        pkill -9 -f beam.smp 2>/dev/null
+        rm -f /run/rabbitmq-server.pid
+        if [ "$cmd" = "restart" ]; then
+            (nohup /opt/rabbitmq/sbin/rabbitmq-server > /var/log/rabbitmq.log 2>&1 &
+             echo $! > /run/rabbitmq-server.pid)
+        fi
     fi
     if [ "${1:-}" = "iscsid" ] || [ "${1:-}" = "iscsi" ]; then
         # stop/disable/enable/reload: kill the daemon.
@@ -399,7 +411,12 @@ echo "no"         | tee /root/nodeconfigured      > /dev/null
 # docker_setup.sh reset flow (dhcpXXXXXX after a reset+reboot cycle), and
 # re-writing "zfsnode" on every start would clobber that.
 #echo "zfsnode"    | tee /root/hostname           > /dev/null
-echo "10.11.11.14" | tee /root/newipaddr        > /dev/null
+# /root/newipaddr is NOT seeded: several instances run from this image, and a
+# fixed default (it used to be 10.11.11.14) made all of them take the same
+# IP. Without the file, docker_setup.sh picks a random 10.11.11.3-42 itself.
+# A file left by an older entrypoint holding the legacy default is dropped;
+# an IP set on purpose (HostManualconfigIPADDR/CLUIP) is left alone.
+[ "$(cat /root/newipaddr 2>/dev/null)" = "10.11.11.14" ] && rm -f /root/newipaddr
 echo "nameserver 10.11.12.7" | tee /root/gitrepo/resolv.conf > /dev/null
 echo "[zfs] seed files ready"
 
@@ -589,7 +606,8 @@ mkdir -p /docker-data
 echo "[zfs] starting dockerd (Docker-in-Docker)…"
 # Use an isolated graph root on host disk so dockerd has no conflicts with
 # the host's docker. /docker-data is bind-mounted from
-# /root/topstor/volumes/zfs-docker-data on the host; the host's
+# /home/topstor/zfs-docker-data on the host (moved there from under the
+# repo — the root disk was nearly full); the host's
 # /var/lib/docker mount is ignored (unmounted above). VFS driver avoids
 # ZFS kernel module deps.
 

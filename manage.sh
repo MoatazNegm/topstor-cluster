@@ -35,8 +35,10 @@
 #   ./volumes/linux-env              -> /workspace   (TopStor/pace/topstorweb)
 #   ./volumes/puppet-srv             -> /srv/git     (abdopuppet git repos)
 #   ./volumes/linux-env-proxy        -> /workspace   (proxy workspace)
-#   ./volumes/zfs-docker-data        -> /docker-data (DinD graph root)
-#   ./volumes/zfs-docker-images      -> /docker-images (RO image tarballs)
+#   /home/topstor/zfs-docker-data     -> /docker-data (DinD graph root; moved
+#                                        off the root disk, which was nearly
+#                                        full — /home has far more headroom)
+#   /home/topstor/zfs-docker-images   -> /docker-images (RO image tarballs)
 #   ./volumes/zfs-tmp/docker_setup_disabled -> /tmp/docker_setup_disabled (flag)
 #
 # Virtual disks (host losetup + container --device):
@@ -65,16 +67,16 @@ cd "$REPO_ROOT"
 # ensure_network — create the cluster bridge if it doesn't already exist.
 # ----------------------------------------------------------------------------
 ensure_network() {
-    if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "[manage] creating network $NETWORK_NAME ($NETWORK_SUBNET, gw=$NETWORK_GATEWAY)"
-    docker network create \
-        --driver bridge \
-        --subnet "$NETWORK_SUBNET" \
-        --gateway "$NETWORK_GATEWAY" \
-        "$NETWORK_NAME"
-}
+	if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+		return 0
+	fi
+	echo "[manage] creating network $NETWORK_NAME ($NETWORK_SUBNET, gw=$NETWORK_GATEWAY)"
+	docker network create \
+		--driver bridge \
+		--subnet "$NETWORK_SUBNET" \
+		--gateway "$NETWORK_GATEWAY" \
+		"$NETWORK_NAME"
+	}
 
 # ----------------------------------------------------------------------------
 # ensure_loop_disks — make sure /dev/loop{1,2,3} on the host are attached to
@@ -83,41 +85,41 @@ ensure_network() {
 # Called before run_zfs() so the container can mount the loop devices.
 # ----------------------------------------------------------------------------
 ensure_loop_disks() {
-    mkdir -p "$DISK_DIR"
-    for i in 1 2 3; do
-        img="$DISK_DIR/disk${i}.img"
-        dev="/dev/loop${i}"
-        if [ ! -f "$img" ]; then
-            echo "[manage] creating $img (10 GB sparse)"
-            truncate -s 10G "$img"
-        fi
-        current=$(losetup -l --noheadings -O BACK-FILE "$dev" 2>/dev/null | tr -d ' ' || true)
-        if [ "$current" != "$img" ]; then
-            echo "[manage] attaching $dev -> $img"
-            losetup "$dev" "$img"
-        fi
-    done
+	mkdir -p "$DISK_DIR"
+	for i in 1 2 3; do
+		img="$DISK_DIR/disk${i}.img"
+		dev="/dev/loop${i}"
+		if [ ! -f "$img" ]; then
+			echo "[manage] creating $img (10 GB sparse)"
+			truncate -s 10G "$img"
+		fi
+		current=$(losetup -l --noheadings -O BACK-FILE "$dev" 2>/dev/null | tr -d ' ' || true)
+		if [ "$current" != "$img" ]; then
+			echo "[manage] attaching $dev -> $img"
+			losetup "$dev" "$img"
+		fi
+	done
 }
 
 # ----------------------------------------------------------------------------
 # run_abdopuppet — git backplane (git-daemon + lighttpd + sshd).
 # ----------------------------------------------------------------------------
 run_abdopuppet() {
-    echo "[manage] starting abdopuppet ($ABDOPUPPET_IMAGE)"
-    docker rm -f abdopuppet >/dev/null 2>&1 || true
-    docker run -d \
-        --name abdopuppet \
-        --hostname abdopuppet \
-        --restart unless-stopped \
-        -p 5022:22 \
-        -p 5080:80 \
-        -p 9418:9418 \
-        -v "$REPO_ROOT/volumes/puppet-srv:/srv/git" \
-        -v "$REPO_ROOT/scripts/entrypoint-abdopuppet.sh:/usr/local/bin/entrypoint.sh:ro" \
-        --network "$NETWORK_NAME" \
-        --ip 10.11.11.252 \
-        "$ABDOPUPPET_IMAGE"
-}
+	echo "[manage] starting abdopuppet ($ABDOPUPPET_IMAGE)"
+	docker rm -f abdopuppet >/dev/null 2>&1 || true
+	docker run -d \
+		--name abdopuppet \
+		--hostname abdopuppet \
+		--restart unless-stopped \
+		-p 5022:22 \
+		-p 5080:80 \
+		-p 9418:9418 \
+		-v "$REPO_ROOT/volumes/puppet-srv:/srv/git" \
+		-v "$REPO_ROOT/scripts/entrypoint-abdopuppet.sh:/usr/local/bin/entrypoint.sh:ro" \
+		--network "$NETWORK_NAME" \
+		--ip 10.11.11.252 \
+		"$ABDOPUPPET_IMAGE"
+	}
 
 # ----------------------------------------------------------------------------
 # run_zfs — storage node. The key flags for reboot.sh to work:
@@ -126,38 +128,46 @@ run_abdopuppet() {
 #   --stop-timeout 30   graceful 30s before SIGKILL
 # ----------------------------------------------------------------------------
 run_zfs() {
-    # Three 10 GB virtual disks — host loops set up by ensure_loop_disks().
-    # Persistent across zfs restarts because the loops are host-side.
-    # /lib/modules is bind-mounted RO from the host so kernel modules
-    # (target_core_mod, iscsi_target_mod, etc.) load inside zfs. The
-    # kernel is shared with the host, so the host's modules just work.
-    echo "[manage] starting zfs ($ZFS_IMAGE)"
-    docker rm -f zfs >/dev/null 2>&1 || true
-    docker run -d \
-        --name zfs \
-        --hostname zfs \
-        --privileged \
-        --init \
-        --stop-timeout 30 \
-        --restart unless-stopped \
-        -p 2222:22 \
-        -v "$REPO_ROOT/volumes/linux-env:/workspace" \
-        -v "$REPO_ROOT/scripts/entrypoint-zfs.sh:/usr/local/bin/entrypoint.sh:ro" \
-        -v /var/lib/docker:/var/lib/docker \
-        -v "$REPO_ROOT/volumes/linux-env/TopStordata:/TopStordata" \
-        -v "$REPO_ROOT/volumes/linux-env/root:/root" \
-        -v "$REPO_ROOT/volumes/linux-env/etc-networkmanager-conf.d:/etc/NetworkManager/conf.d:ro" \
-        -v "$REPO_ROOT/volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro" \
-        -v /proc/1/ns/net:/host-ns/net \
-        -v "$REPO_ROOT/volumes/zfs-docker-images:/docker-images:ro" \
-        -v "$REPO_ROOT/volumes/zfs-docker-data:/docker-data" \
-        -v /lib/modules:/lib/modules:ro \
-        --device /dev/loop1:/dev/loop1 \
-        --device /dev/loop2:/dev/loop2 \
-        --device /dev/loop3:/dev/loop3 \
-        --network "$NETWORK_NAME" \
-        --ip 10.11.11.101 \
-        "$ZFS_IMAGE"
+	# Three 10 GB virtual disks — host loops set up by ensure_loop_disks().
+	# Persistent across zfs restarts because the loops are host-side.
+	# /lib/modules is bind-mounted RO from the host so kernel modules
+	# (target_core_mod, iscsi_target_mod, etc.) load inside zfs. The
+	# kernel is shared with the host, so the host's modules just work.
+	echo "[manage] starting zfs ($ZFS_IMAGE)"
+	docker start zfs
+	if [ $? -ne 0 ];
+	then
+		docker rm -f zfs >/dev/null 2>&1 || true
+		docker run -d \
+			--name zfs \
+			--hostname zfs \
+			--privileged \
+			--init \
+			--stop-timeout 30 \
+			--restart unless-stopped \
+			-p 2222:22 \
+			-v "$REPO_ROOT/volumes/linux-env:/workspace" \
+			-v "$REPO_ROOT/scripts/entrypoint-zfs.sh:/usr/local/bin/entrypoint.sh:ro" \
+			-v /var/lib/docker:/var/lib/docker \
+			-v "$REPO_ROOT/volumes/linux-env/TopStordata:/TopStordata" \
+			-v "$REPO_ROOT/volumes/linux-env/root:/root" \
+			-v "$REPO_ROOT/volumes/linux-env/etc-networkmanager-conf.d:/etc/NetworkManager/conf.d:ro" \
+			-v "$REPO_ROOT/volumes/zfs-tmp/docker_setup_disabled:/tmp/docker_setup_disabled:ro" \
+			-v /proc/1/ns/net:/host-ns/net \
+			-v "/home/topstor/zfs-docker-images:/docker-images:ro" \
+			-v "/home/topstor/zfs-docker-data:/docker-data" \
+			-v /lib/modules:/lib/modules:ro \
+			--device /dev/loop1:/dev/loop1 \
+			--device /dev/loop2:/dev/loop2 \
+			--device /dev/loop3:/dev/loop3 \
+			--network "$NETWORK_NAME" \
+			--ip 10.11.11.101 \
+			"$ZFS_IMAGE"
+	fi
+	# Let the container's chronyc control the host's chronyd (a live mount, so it
+	# must be redone after every start/recreate). Non-fatal.
+	"$REPO_ROOT/scripts/zfs-chrony-link.sh" zfs \
+		|| echo "[manage] WARNING: chrony link for zfs failed (host chronyd down?)"
 }
 
 # ----------------------------------------------------------------------------
@@ -165,33 +175,33 @@ run_zfs() {
 # reason as zfs (clean SIGTERM, no zombie sshd sessions).
 # ----------------------------------------------------------------------------
 run_proxy() {
-    echo "[manage] starting proxy ($PROXY_IMAGE)"
-    docker rm -f proxy >/dev/null 2>&1 || true
-    docker run -d \
-        --name proxy \
-        --hostname proxy \
-        --init \
-        --privileged \
-        --restart unless-stopped \
-        -p 2223:22 \
-        -p 8080:80 \
-        -v "$REPO_ROOT/volumes/linux-env-proxy:/workspace" \
-        -v "$REPO_ROOT/scripts/entrypoint-proxy.sh:/usr/local/bin/entrypoint.sh:ro" \
-        --network "$NETWORK_NAME" \
-        --ip 10.11.11.4 \
-        "$PROXY_IMAGE"
-}
+	echo "[manage] starting proxy ($PROXY_IMAGE)"
+	docker rm -f proxy >/dev/null 2>&1 || true
+	docker run -d \
+		--name proxy \
+		--hostname proxy \
+		--init \
+		--privileged \
+		--restart unless-stopped \
+		-p 2223:22 \
+		-p 8080:80 \
+		-v "$REPO_ROOT/volumes/linux-env-proxy:/workspace" \
+		-v "$REPO_ROOT/scripts/entrypoint-proxy.sh:/usr/local/bin/entrypoint.sh:ro" \
+		--network "$NETWORK_NAME" \
+		--ip 10.11.11.4 \
+		"$PROXY_IMAGE"
+	}
 
 # ----------------------------------------------------------------------------
 # start — bring the whole cluster up.
 # ----------------------------------------------------------------------------
 start() {
-    ensure_network
-    ensure_loop_disks
-    run_abdopuppet
-    run_zfs
-    run_proxy
-    echo "[manage] cluster up.  ssh into zfs:  ssh -p 2222 root@localhost"
+	ensure_network
+	ensure_loop_disks
+	run_abdopuppet
+	run_zfs
+	run_proxy
+	echo "[manage] cluster up.  ssh into zfs:  ssh -p 2222 root@localhost"
 }
 
 # ----------------------------------------------------------------------------
@@ -199,58 +209,58 @@ start() {
 # until explicitly started again because the policy is unless-stopped).
 # ----------------------------------------------------------------------------
 stop() {
-    for name in abdopuppet zfs proxy; do
-        if docker ps --format '{{.Names}}' | grep -qx "$name"; then
-            echo "[manage] stopping $name"
-            docker stop "$name"
-        else
-            echo "[manage] $name already stopped"
-        fi
-    done
+	for name in abdopuppet zfs proxy; do
+		if docker ps --format '{{.Names}}' | grep -qx "$name"; then
+			echo "[manage] stopping $name"
+			docker stop "$name"
+		else
+			echo "[manage] $name already stopped"
+		fi
+	done
 }
 
 # ----------------------------------------------------------------------------
 # recreate — tear down and re-create every container from its image.
 # ----------------------------------------------------------------------------
 recreate() {
-    start
+	start
 }
 
 # ----------------------------------------------------------------------------
 # status — pretty print container states.
 # ----------------------------------------------------------------------------
 status() {
-    for name in abdopuppet zfs proxy; do
-        if docker ps --format '{{.Names}}' | grep -qx "$name"; then
-            printf '  %-12s %s\n' "$name" "$(docker ps --filter "name=^${name}\$" --format '{{.Status}}')"
-        else
-            printf '  %-12s %s\n' "$name" "DOWN"
-        fi
-    done
+	for name in abdopuppet zfs proxy; do
+		if docker ps --format '{{.Names}}' | grep -qx "$name"; then
+			printf '  %-12s %s\n' "$name" "$(docker ps --filter "name=^${name}\$" --format '{{.Status}}')"
+		else
+			printf '  %-12s %s\n' "$name" "DOWN"
+		fi
+	done
 }
 
 # ----------------------------------------------------------------------------
 # logs — tail logs from each. Falls through if a container doesn't exist.
 # ----------------------------------------------------------------------------
 logs() {
-    for name in abdopuppet zfs proxy; do
-        echo "===== $name ====="
-        docker logs --tail=20 "$name" 2>&1 || echo "(no logs for $name)"
-    done
+	for name in abdopuppet zfs proxy; do
+		echo "===== $name ====="
+		docker logs --tail=20 "$name" 2>&1 || echo "(no logs for $name)"
+	done
 }
 
 # ----------------------------------------------------------------------------
 # entrypoint
 # ----------------------------------------------------------------------------
 case "${1:-start}" in
-    start)    start ;;
-    stop)     stop ;;
-    restart)  stop; start ;;
-    status)   status ;;
-    recreate) recreate ;;
-    logs)     logs ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|status|recreate|logs}" >&2
-        exit 2
-        ;;
+	start)    start ;;
+	stop)     stop ;;
+	restart)  stop; start ;;
+	status)   status ;;
+	recreate) recreate ;;
+	logs)     logs ;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status|recreate|logs}" >&2
+		exit 2
+		;;
 esac
